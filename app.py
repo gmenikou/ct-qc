@@ -262,6 +262,298 @@ def value_in_range(value, low, high):
 # CT PARSERS
 # =========================================================
 
+def extract_numbers(line):
+    return [safe_float(x) for x in re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", line)]
+
+
+# ---------------------------------------------------------
+# HOMOGENEITY
+# ---------------------------------------------------------
+def parse_ct_homogeneity(text):
+    section = extract_section(
+        text,
+        "1 Homogeneity (IEC Constancy)",
+        "2 Noise (IEC Constancy)",
+    )
+
+    values = []
+    failed = []
+
+    current_low, current_high = None, None
+
+    for line in section.splitlines():
+
+        # inline tolerance format
+        m = re.search(r"([-+]?\d+\.\d+)\s+[-+]?\d+\.\d+\s+([-+]?\d+\.\d+)\s*…\s*([-+]?\d+\.\d+)", line)
+        if m:
+            val = safe_float(m.group(1))
+            low = safe_float(m.group(2))
+            high = safe_float(m.group(3))
+            values.append((val, low, high))
+            if not value_in_range(val, low, high):
+                failed.append(f"{val} not in [{low},{high}]")
+            continue
+
+        # tolerance header
+        tol = re.search(r"Tolerance:\s*([-+]?\d+\.\d+)\s*…\s*([-+]?\d+\.\d+)", line)
+        if tol:
+            current_low = safe_float(tol.group(1))
+            current_high = safe_float(tol.group(2))
+            continue
+
+        # simple rows
+        nums = extract_numbers(line)
+        if len(nums) >= 2 and current_low is not None:
+            val = nums[1]
+            values.append((val, current_low, current_high))
+            if not value_in_range(val, current_low, current_high):
+                failed.append(f"{val} not in [{current_low},{current_high}]")
+
+    if not values:
+        return {
+            "test_name": "Homogeneity",
+            "value": None,
+            "unit": "HU",
+            "criteria": "Worst HU",
+            "status": "FAIL",
+            "details": "Parsing failed",
+        }
+
+    worst = max(values, key=lambda x: abs(x[0]))
+    return {
+        "test_name": "Homogeneity",
+        "value": worst[0],
+        "unit": "HU",
+        "criteria": "Worst HU",
+        "status": "PASS" if not failed else "FAIL",
+        "details": f"Worst value {worst[0]} [{worst[1]},{worst[2]}]",
+    }
+
+
+# ---------------------------------------------------------
+# NOISE
+# ---------------------------------------------------------
+def parse_ct_noise(text):
+    section = extract_section(
+        text,
+        "2 Noise (IEC Constancy)",
+        "3 MTF (IEC Constancy)",
+    )
+
+    values = []
+    failed = []
+
+    for line in section.splitlines():
+        m = re.search(
+            r"\d+\s+([-+]?\d+\.\d+)\s+[-+]?\d+\.\d+\s+([-+]?\d+\.\d+)\s*…\s*([-+]?\d+\.\d+)\s+(In Tol\.|Out Tol\.)",
+            line,
+        )
+        if m:
+            val = safe_float(m.group(1))
+            low = safe_float(m.group(2))
+            high = safe_float(m.group(3))
+            status = m.group(4)
+
+            values.append((val, low, high))
+
+            if "Out" in status or not value_in_range(val, low, high):
+                failed.append(val)
+
+    if not values:
+        return {
+            "test_name": "Noise",
+            "value": None,
+            "unit": "HU",
+            "criteria": "Worst noise",
+            "status": "FAIL",
+            "details": "Parsing failed",
+        }
+
+    worst = max(values, key=lambda x: x[0])
+    return {
+        "test_name": "Noise",
+        "value": worst[0],
+        "unit": "HU",
+        "criteria": "Worst noise",
+        "status": "PASS" if not failed else "FAIL",
+        "details": f"Worst noise {worst[0]} [{worst[1]},{worst[2]}]",
+    }
+
+
+# ---------------------------------------------------------
+# MTF
+# ---------------------------------------------------------
+def parse_ct_mtf(text):
+    section = extract_section(
+        text,
+        "3 MTF (IEC Constancy)",
+        "4 Table Positioning (IEC Constancy)",
+    )
+
+    vals50, vals10 = [], []
+
+    for line in section.splitlines():
+        nums = extract_numbers(line)
+
+        # Siemens format: slice val50 ref50 val10 ref10
+        if len(nums) == 5:
+            val50 = nums[1]
+            val10 = nums[3]
+
+            vals50.append(val50)
+            vals10.append(val10)
+
+    if not vals50:
+        return [
+            {
+                "test_name": "MTF 50%",
+                "value": None,
+                "unit": "lp/cm",
+                "criteria": "Worst",
+                "status": "FAIL",
+                "details": "Parsing failed",
+            },
+            {
+                "test_name": "MTF 10%",
+                "value": None,
+                "unit": "lp/cm",
+                "criteria": "Worst",
+                "status": "FAIL",
+                "details": "Parsing failed",
+            },
+        ]
+
+    return [
+        {
+            "test_name": "MTF 50%",
+            "value": min(vals50),
+            "unit": "lp/cm",
+            "criteria": "Lowest",
+            "status": "PASS",
+            "details": f"Min {min(vals50)}",
+        },
+        {
+            "test_name": "MTF 10%",
+            "value": min(vals10),
+            "unit": "lp/cm",
+            "criteria": "Lowest",
+            "status": "PASS",
+            "details": f"Min {min(vals10)}",
+        },
+    ]
+
+
+# ---------------------------------------------------------
+# TABLE POSITIONING
+# ---------------------------------------------------------
+def parse_ct_table_positioning(text):
+    section = extract_section(
+        text,
+        "4 Table Positioning (IEC Constancy)",
+        "5 Tube Voltage (IEC Constancy)",
+    )
+
+    deviations = []
+    failed = []
+
+    for line in section.splitlines():
+        nums = extract_numbers(line)
+
+        if len(nums) >= 6:
+            cont = nums[1]
+            cont_low = nums[2]
+            cont_high = nums[3]
+
+            step = nums[4]
+            step_low = nums[5]
+            step_high = nums[6] if len(nums) > 6 else nums[5]
+
+            if not value_in_range(cont, cont_low, cont_high):
+                failed.append(cont)
+            if not value_in_range(step, step_low, step_high):
+                failed.append(step)
+
+            deviations.append(abs(cont))
+            deviations.append(abs(step))
+
+    if not deviations:
+        return {
+            "test_name": "Table Positioning",
+            "value": None,
+            "unit": "mm",
+            "criteria": "Within tolerance",
+            "status": "FAIL",
+            "details": "Parsing failed",
+        }
+
+    return {
+        "test_name": "Table Positioning",
+        "value": max(deviations),
+        "unit": "mm",
+        "criteria": "Within tolerance",
+        "status": "PASS" if not failed else "FAIL",
+        "details": f"Max deviation {max(deviations)}",
+    }
+
+
+# ---------------------------------------------------------
+# TUBE VOLTAGE
+# ---------------------------------------------------------
+def parse_ct_tube_voltage(text):
+    section = extract_section(
+        text,
+        "5 Tube Voltage (IEC Constancy)",
+        "6 Image Inspection (Constancy)",
+    )
+
+    deviations = []
+
+    for line in section.splitlines():
+        nums = extract_numbers(line)
+
+        if len(nums) >= 4:
+            nominal = nums[0]
+            measured = nums[2]
+
+            deviations.append(abs(measured - nominal))
+
+    if not deviations:
+        return {
+            "test_name": "Tube Voltage",
+            "value": None,
+            "unit": "kV",
+            "criteria": "Within tolerance",
+            "status": "FAIL",
+            "details": "Parsing failed",
+        }
+
+    return {
+        "test_name": "Tube Voltage",
+        "value": max(deviations),
+        "unit": "kV",
+        "criteria": "Within tolerance",
+        "status": "PASS",
+        "details": f"Max deviation {max(deviations)}",
+    }
+
+
+# ---------------------------------------------------------
+# IMAGE INSPECTION
+# ---------------------------------------------------------
+def parse_ct_image_inspection(text):
+    section = extract_section(text, "6 Image Inspection", None)
+
+    accept = len(re.findall(r"\bAccept\b", section))
+    reject = len(re.findall(r"\bReject|Fail\b", section))
+
+    return {
+        "test_name": "Image Inspection",
+        "value": accept,
+        "unit": "items",
+        "criteria": "All Accept",
+        "status": "PASS" if reject == 0 else "FAIL",
+        "details": f"{accept} accepted, {reject} rejected",
+    }
 # =========================================================
 # GITHUB HELPERS
 # =========================================================
