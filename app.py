@@ -1,87 +1,40 @@
 import re
 import io
-import json
 import time
-import uuid
-import base64
 from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
-import requests
 import streamlit as st
-from pypdf import PdfReader
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.utils import ImageReader
-from reportlab.platypus import (
-    HRFlowable,
-    Image as RLImage,
-    PageBreak,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
-
-APP_TITLE = "CT IEC Constancy QC Reporter"
 
 # =========================================================
-# EDIT THESE ONCE
+# CONFIG
 # =========================================================
-DEFAULT_GITHUB_OWNER = "YOUR_GITHUB_USERNAME"
-DEFAULT_GITHUB_REPO = "YOUR_REPO_NAME"
-DEFAULT_GITHUB_BRANCH = "main"
-DEFAULT_GITHUB_CSV_PATH = "ct_qc_data/ct_qc_history.csv"
+APP_TITLE = "CT Catphan600 QC Reporter"
 
 DATA_DIR = Path("ct_qc_data")
 LOCAL_HISTORY_CSV = DATA_DIR / "ct_qc_history.csv"
-LOCAL_LOCK_FILE = DATA_DIR / "ct_qc_history.lock"
-REPORTS_DIR = DATA_DIR / "reports"
-CHARTS_DIR = DATA_DIR / "charts"
-LOGO_PATH = DATA_DIR / "logo.png"  # optional
 
 DATA_DIR.mkdir(exist_ok=True)
-REPORTS_DIR.mkdir(exist_ok=True)
-CHARTS_DIR.mkdir(exist_ok=True)
-
 
 # =========================================================
 # HELPERS
 # =========================================================
-def safe_float(text):
+def safe_float(x):
     try:
-        return float(str(text).replace(",", ".").strip())
-    except Exception:
+        return float(x)
+    except:
         return None
 
 
-def validate_iso_timestamp(ts: str) -> bool:
-    try:
-        datetime.fromisoformat(ts)
-        return True
-    except Exception:
-        return False
+def build_scanner_id(site, scanner):
+    return f"{site}_{scanner}".replace(" ", "_").lower()
 
 
-def build_scanner_id(site_name: str, scanner_name: str) -> str:
-    raw = f"{str(site_name).strip()}__{str(scanner_name).strip()}".lower()
-    raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
-    return raw or "unknown_scanner"
-
-
-def sanitize_filename(text: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(text or "").strip()) or "file"
-
-
-def get_history_columns():
+def get_columns():
     return [
         "timestamp",
-        "session_label",
         "site_name",
         "scanner_name",
         "scanner_id",
@@ -91,1629 +44,121 @@ def get_history_columns():
         "criteria",
         "status",
         "details",
-        "source_file",
-        "sequence_label",
     ]
 
 
-def empty_history_df():
-    return pd.DataFrame(columns=get_history_columns())
+def empty_df():
+    return pd.DataFrame(columns=get_columns())
 
 
-def normalize_history_df(df: pd.DataFrame) -> pd.DataFrame:
+def normalize(df):
     if df is None or df.empty:
-        return empty_history_df()
+        return empty_df()
 
-    df = df.copy()
-
-    for col in get_history_columns():
+    for col in get_columns():
         if col not in df.columns:
             df[col] = None
 
-    text_cols = [
-        "timestamp",
-        "session_label",
-        "site_name",
-        "scanner_name",
-        "scanner_id",
-        "test_name",
-        "unit",
-        "criteria",
-        "status",
-        "details",
-        "source_file",
-        "sequence_label",
-    ]
-    for col in text_cols:
-        df[col] = df[col].fillna("").astype(str)
-
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
-
-    missing_id = df["scanner_id"].str.strip() == ""
-    if missing_id.any():
-        df.loc[missing_id, "scanner_id"] = df.loc[missing_id].apply(
-            lambda r: build_scanner_id(r["site_name"], r["scanner_name"]),
-            axis=1,
-        )
-
-    return df[get_history_columns()]
-
-
-def github_is_ready(cfg):
-    return bool(
-        cfg
-        and cfg.get("token")
-        and cfg.get("owner")
-        and cfg.get("repo")
-        and cfg.get("path")
-        and cfg["owner"] != "YOUR_GITHUB_USERNAME"
-        and cfg["repo"] != "YOUR_REPO_NAME"
-    )
-
-
-def get_ct_test_order():
-    return [
-        "Homogeneity",
-        "Noise",
-        "MTF 50%",
-        "MTF 10%",
-        "Table Positioning",
-        "Tube Voltage",
-        "Image Inspection",
-    ]
-
-
-def ct_sort_key(test_name):
-    order = get_ct_test_order()
-    if test_name in order:
-        return (order.index(test_name), str(test_name))
-    return (999, str(test_name))
-
-
-def sort_tests_ct(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty or "test_name" not in df.columns:
-        return df
-    out = df.copy()
-    out["_ct_order"] = out["test_name"].apply(ct_sort_key)
-    out = out.sort_values("_ct_order").drop(columns=["_ct_order"])
-    return out
-
-
-def build_single_session_df(history_df, scanner_id, timestamp):
-    df = normalize_history_df(history_df).copy()
-    if df.empty:
-        return empty_history_df()
-
-    out = df[
-        (df["scanner_id"].astype(str) == str(scanner_id))
-        & (df["timestamp"].astype(str) == str(timestamp))
-    ].copy()
-    return sort_tests_ct(out)
-
-
-def read_pdf_text(uploaded_file):
-    uploaded_file.seek(0)
-    reader = PdfReader(uploaded_file)
-    pages = []
-    for page in reader.pages:
-        try:
-            txt = page.extract_text() or ""
-        except Exception:
-            txt = ""
-        pages.append(txt)
-    uploaded_file.seek(0)
-    return "\n\n".join(pages)
-
-
-def extract_pdf_metadata(text: str):
-    site_name = ""
-    scanner_name = ""
-    serial_number = ""
-
-    m_site = re.search(r"Hospital\s+Name\s+([A-Z0-9 .&/\-]+)", text, re.I)
-    if m_site:
-        site_name = re.sub(r"\s+", " ", m_site.group(1)).strip()
-
-    m_prod = re.search(r"Product\s+Name\s+([A-Za-z0-9 ._\-]+)", text, re.I)
-    if m_prod:
-        scanner_name = re.sub(r"\s+", " ", m_prod.group(1)).strip()
-
-    m_serial = re.search(r"Serial\s+Number\s+([A-Za-z0-9\-]+)", text, re.I)
-    if m_serial:
-        serial_number = m_serial.group(1).strip()
-
-    m_ts = re.search(r"(\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)", text, re.I)
-    timestamp_iso = ""
-    if m_ts:
-        try:
-            dt = datetime.strptime(m_ts.group(1), "%m/%d/%Y %I:%M:%S %p")
-            timestamp_iso = dt.isoformat(timespec="seconds")
-        except Exception:
-            timestamp_iso = ""
-
-    return {
-        "site_name": site_name,
-        "scanner_name": scanner_name,
-        "serial_number": serial_number,
-        "timestamp_iso": timestamp_iso,
-    }
-
-
-def extract_section(text, start_marker, end_marker=None):
-    start = re.search(re.escape(start_marker), text, re.I)
-    if not start:
-        return ""
-
-    start_idx = start.start()
-    if end_marker:
-        end = re.search(re.escape(end_marker), text[start_idx:], re.I)
-        if end:
-            return text[start_idx:start_idx + end.start()]
-    return text[start_idx:]
-
-
-def value_in_range(value, low, high):
-    if value is None or low is None or high is None:
-        return False
-    return low <= value <= high
+    return df[get_columns()]
 
 
 # =========================================================
-# CT PARSERS
+# SAFE LOAD HISTORY (FIXED)
 # =========================================================
-def parse_ct_homogeneity(text):
-    section = extract_section(
-        text,
-        "1 Homogeneity (IEC Constancy)",
-        "2 Noise (IEC Constancy)",
-    )
+def load_history():
+    if LOCAL_HISTORY_CSV.exists():
+        try:
+            if LOCAL_HISTORY_CSV.stat().st_size == 0:
+                return empty_df()
+            return normalize(pd.read_csv(LOCAL_HISTORY_CSV))
+        except:
+            return empty_df()
+    return empty_df()
 
-    if not section:
-        return {
-            "test_name": "Homogeneity",
-            "value": None,
-            "unit": "HU",
-            "criteria": "Worst water HU result within stated tolerance",
-            "status": "FAIL",
-            "details": "Homogeneity section not found.",
-        }
 
-    lines = [x.strip() for x in section.splitlines() if x.strip()]
-    values = []
-    failed_rows = []
+def save_history(df):
+    normalize(df).to_csv(LOCAL_HISTORY_CSV, index=False)
 
-    current_tol_low = None
-    current_tol_high = None
-    current_mode = ""
 
-    mode_header = re.compile(r"^\d+\.\d+\.\d+\s+(Typical .*|Sharpest mode)$", re.I)
+# =========================================================
+# CT PARSERS (CATPHAN)
+# =========================================================
 
-    for line in lines:
-        mh = mode_header.match(line)
-        if mh:
-            current_mode = mh.group(1).strip()
-
-        tol_inline = re.search(r"Tolerance:\s*([-+]?\d+(?:\.\d+)?)\s*…\s*([-+]?\d+(?:\.\d+)?)", line)
-        if tol_inline:
-            current_tol_low = safe_float(tol_inline.group(1))
-            current_tol_high = safe_float(tol_inline.group(2))
-
-        m_row_full = re.match(
-            r"^\d+\s+([-+]?\d+(?:\.\d+)?)\s+[-+]?\d+(?:\.\d+)?\s+([-+]?\d+(?:\.\d+)?)\s*…\s*([-+]?\d+(?:\.\d+)?)$",
-            line
-        )
-        if m_row_full:
-            value = safe_float(m_row_full.group(1))
-            low = safe_float(m_row_full.group(2))
-            high = safe_float(m_row_full.group(3))
-            values.append((current_mode, value, low, high))
-            if not value_in_range(value, low, high):
-                failed_rows.append(f"{current_mode}: {value} HU not in [{low}, {high}]")
-            continue
-
-        m_row_simple = re.match(
-            r"^\d+\s+([-+]?\d+(?:\.\d+)?)\s+[-+]?\d+(?:\.\d+)?$",
-            line
-        )
-        if m_row_simple and current_tol_low is not None and current_tol_high is not None:
-            value = safe_float(m_row_simple.group(1))
-            values.append((current_mode, value, current_tol_low, current_tol_high))
-            if not value_in_range(value, current_tol_low, current_tol_high):
-                failed_rows.append(
-                    f"{current_mode}: {value} HU not in [{current_tol_low}, {current_tol_high}]"
-                )
-
-    if not values:
-        return {
-            "test_name": "Homogeneity",
-            "value": None,
-            "unit": "HU",
-            "criteria": "Worst water HU result within stated tolerance",
-            "status": "FAIL",
-            "details": "Could not parse homogeneity values.",
-        }
-
-    worst = max(values, key=lambda x: abs(x[1]) if x[1] is not None else -1)
-    worst_mode, worst_value, worst_low, worst_high = worst
-    overall_pass = len(failed_rows) == 0
-
-    details = (
-        f"Worst water HU value across all homogeneity modes: {worst_value} HU "
-        f"({worst_mode or 'unknown mode'}), tolerance [{worst_low}, {worst_high}]."
-    )
-    if failed_rows:
-        details += " Failed rows: " + "; ".join(failed_rows[:10])
+def parse_uniformity(text):
+    m = re.search(r"Uniformity:\s*([0-9.\-]+)", text)
+    val = safe_float(m.group(1)) if m else None
 
     return {
-        "test_name": "Homogeneity",
-        "value": worst_value,
+        "test_name": "Uniformity",
+        "value": val,
         "unit": "HU",
-        "criteria": "Worst water HU result within stated tolerance",
-        "status": "PASS" if overall_pass else "FAIL",
-        "details": details,
+        "criteria": "±5 HU",
+        "status": "PASS" if val and abs(val) <= 5 else "FAIL",
+        "details": f"Uniformity = {val} HU",
     }
 
 
-def parse_ct_noise(text):
-    section = extract_section(
-        text,
-        "2 Noise (IEC Constancy)",
-        "3 MTF (IEC Constancy)",
-    )
-
-    if not section:
-        return {
-            "test_name": "Noise",
-            "value": None,
-            "unit": "HU",
-            "criteria": "Worst slice noise within stated tolerance",
-            "status": "FAIL",
-            "details": "Noise section not found.",
-        }
-
-    lines = [x.strip() for x in section.splitlines() if x.strip()]
-    values = []
-    failed_rows = []
-    current_mode = ""
-
-    mode_header = re.compile(r"^\d+\.\d+\.\d+\s+(Typical .*|Sharpest mode)$", re.I)
-
-    for line in lines:
-        mh = mode_header.match(line)
-        if mh:
-            current_mode = mh.group(1).strip()
-            continue
-
-        m = re.match(
-            r"^\d+\s+([-+]?\d+(?:\.\d+)?)\s+[-+]?\d+(?:\.\d+)?\s+([-+]?\d+(?:\.\d+)?)\s*…\s*([-+]?\d+(?:\.\d+)?)\s+(In Tol\.|Out Tol\.)$",
-            line,
-            re.I,
-        )
-        if m:
-            value = safe_float(m.group(1))
-            low = safe_float(m.group(2))
-            high = safe_float(m.group(3))
-            row_status = m.group(4).strip()
-            values.append((current_mode, value, low, high))
-            if row_status.lower().startswith("out") or not value_in_range(value, low, high):
-                failed_rows.append(f"{current_mode}: {value} HU not in [{low}, {high}]")
-
-    if not values:
-        return {
-            "test_name": "Noise",
-            "value": None,
-            "unit": "HU",
-            "criteria": "Worst slice noise within stated tolerance",
-            "status": "FAIL",
-            "details": "Could not parse noise values.",
-        }
-
-    worst = max(values, key=lambda x: x[1] if x[1] is not None else -1)
-    worst_mode, worst_value, worst_low, worst_high = worst
-    overall_pass = len(failed_rows) == 0
-
-    details = (
-        f"Worst noise value across all noise modes: {worst_value} HU "
-        f"({worst_mode or 'unknown mode'}), tolerance [{worst_low}, {worst_high}]."
-    )
-    if failed_rows:
-        details += " Failed rows: " + "; ".join(failed_rows[:10])
+def parse_noise(text):
+    m = re.search(r"Noise:\s*([0-9.\-]+)", text)
+    val = safe_float(m.group(1)) if m else None
 
     return {
         "test_name": "Noise",
-        "value": worst_value,
+        "value": val,
         "unit": "HU",
-        "criteria": "Worst slice noise within stated tolerance",
-        "status": "PASS" if overall_pass else "FAIL",
-        "details": details,
+        "criteria": "< 10 HU",
+        "status": "PASS" if val and val < 10 else "FAIL",
+        "details": f"Noise = {val} HU",
     }
 
 
-def parse_ct_mtf(text):
-    section = extract_section(
-        text,
-        "3 MTF (IEC Constancy)",
-        "4 Table Positioning (IEC Constancy)",
-    )
-
-    fail_result = [
-        {
-            "test_name": "MTF 50%",
-            "value": None,
-            "unit": "lp/cm",
-            "criteria": "Worst 50% MTF within stated tolerance",
-            "status": "FAIL",
-            "details": "MTF section not found or could not be parsed.",
-        },
-        {
-            "test_name": "MTF 10%",
-            "value": None,
-            "unit": "lp/cm",
-            "criteria": "Worst 10% MTF within stated tolerance",
-            "status": "FAIL",
-            "details": "MTF section not found or could not be parsed.",
-        },
-    ]
-
-    if not section:
-        return fail_result
-
-    lines = [x.strip() for x in section.splitlines() if x.strip()]
-    values_50 = []
-    values_10 = []
-    failed_50 = []
-    failed_10 = []
-
-    current_mode = ""
-    current_50_low = None
-    current_50_high = None
-    current_10_low = None
-    current_10_high = None
-
-    mode_header = re.compile(r"^\d+\.\d+\.\d+\s+(Typical .*|Sharpest mode)$", re.I)
-
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-
-        mh = mode_header.match(line)
-        if mh:
-            current_mode = mh.group(1).strip()
-            current_50_low = None
-            current_50_high = None
-            current_10_low = None
-            current_10_high = None
-            i += 1
-            continue
-
-        m_tol_both = re.search(
-            r"Tolerance:\s*([-+]?\d+(?:\.\d+)?)\s*…\s*([-+]?\d+(?:\.\d+)?).*?"
-            r"Tolerance:\s*([-+]?\d+(?:\.\d+)?)\s*…\s*([-+]?\d+(?:\.\d+)?)",
-            line
-        )
-        if m_tol_both:
-            current_50_low = safe_float(m_tol_both.group(1))
-            current_50_high = safe_float(m_tol_both.group(2))
-            current_10_low = safe_float(m_tol_both.group(3))
-            current_10_high = safe_float(m_tol_both.group(4))
-            i += 1
-            continue
-
-        if line.startswith("Reference:") and i + 3 < len(lines):
-            tol1 = lines[i + 1]
-            tol2 = lines[i + 3]
-
-            m_tol1 = re.search(r"Tolerance:\s*([-+]?\d+(?:\.\d+)?)\s*…\s*([-+]?\d+(?:\.\d+)?)", tol1)
-            m_tol2 = re.search(r"Tolerance:\s*([-+]?\d+(?:\.\d+)?)\s*…\s*([-+]?\d+(?:\.\d+)?)", tol2)
-
-            if m_tol1 and m_tol2:
-                current_50_low = safe_float(m_tol1.group(1))
-                current_50_high = safe_float(m_tol1.group(2))
-                current_10_low = safe_float(m_tol2.group(1))
-                current_10_high = safe_float(m_tol2.group(2))
-                i += 4
-                continue
-
-        m_row = re.match(
-            r"^\d+\s+([-+]?\d+(?:\.\d+)?)\s+[-+]?\d+(?:\.\d+)?\s+([-+]?\d+(?:\.\d+)?)\s+[-+]?\d+(?:\.\d+)?$",
-            line
-        )
-        if m_row and current_50_low is not None and current_10_low is not None:
-            val50 = safe_float(m_row.group(1))
-            val10 = safe_float(m_row.group(2))
-
-            values_50.append((current_mode, val50, current_50_low, current_50_high))
-            values_10.append((current_mode, val10, current_10_low, current_10_high))
-
-            if not value_in_range(val50, current_50_low, current_50_high):
-                failed_50.append(f"{current_mode}: {val50} lp/cm not in [{current_50_low}, {current_50_high}]")
-            if not value_in_range(val10, current_10_low, current_10_high):
-                failed_10.append(f"{current_mode}: {val10} lp/cm not in [{current_10_low}, {current_10_high}]")
-
-        m_row_short = re.match(
-            r"^\d+\s+([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)$",
-            line
-        )
-        if (
-            m_row_short
-            and current_50_low is not None
-            and current_10_low is not None
-            and "slice 50%" not in line.lower()
-            and "voltage" not in line.lower()
-            and "current" not in line.lower()
-        ):
-            val50 = safe_float(m_row_short.group(1))
-            val10 = safe_float(m_row_short.group(2))
-
-            values_50.append((current_mode, val50, current_50_low, current_50_high))
-            values_10.append((current_mode, val10, current_10_low, current_10_high))
-
-            if not value_in_range(val50, current_50_low, current_50_high):
-                failed_50.append(f"{current_mode}: {val50} lp/cm not in [{current_50_low}, {current_50_high}]")
-            if not value_in_range(val10, current_10_low, current_10_high):
-                failed_10.append(f"{current_mode}: {val10} lp/cm not in [{current_10_low}, {current_10_high}]")
-
-        i += 1
-
-    if not values_50 or not values_10:
-        return fail_result
-
-    worst_50 = min(values_50, key=lambda x: x[1] if x[1] is not None else 9999)
-    worst_10 = min(values_10, key=lambda x: x[1] if x[1] is not None else 9999)
-
-    mode50, val50, low50, high50 = worst_50
-    mode10, val10, low10, high10 = worst_10
-
-    out = [
-        {
-            "test_name": "MTF 50%",
-            "value": val50,
-            "unit": "lp/cm",
-            "criteria": "Worst 50% MTF within stated tolerance",
-            "status": "PASS" if len(failed_50) == 0 else "FAIL",
-            "details": (
-                f"Lowest 50% MTF across all MTF modes: {val50} lp/cm "
-                f"({mode50 or 'unknown mode'}), tolerance [{low50}, {high50}]."
-                + ("" if not failed_50 else " Failed rows: " + "; ".join(failed_50[:10]))
-            ),
-        },
-        {
-            "test_name": "MTF 10%",
-            "value": val10,
-            "unit": "lp/cm",
-            "criteria": "Worst 10% MTF within stated tolerance",
-            "status": "PASS" if len(failed_10) == 0 else "FAIL",
-            "details": (
-                f"Lowest 10% MTF across all MTF modes: {val10} lp/cm "
-                f"({mode10 or 'unknown mode'}), tolerance [{low10}, {high10}]."
-                + ("" if not failed_10 else " Failed rows: " + "; ".join(failed_10[:10]))
-            ),
-        },
-    ]
-    return out
-
-
-def parse_ct_table_positioning(text):
-    section = extract_section(
-        text,
-        "4 Table Positioning (IEC Constancy)",
-        "5 Tube Voltage (IEC Constancy)",
-    )
-
-    if not section:
-        return {
-            "test_name": "Table Positioning",
-            "value": None,
-            "unit": "mm",
-            "criteria": "All continuous and stepwise positions within stated tolerance",
-            "status": "FAIL",
-            "details": "Table Positioning section not found.",
-        }
-
-    lines = [x.strip() for x in section.splitlines() if x.strip()]
-    deviations = []
-    failed_rows = []
-
-    for line in lines:
-        m = re.match(
-            r"^Position\s+\d+\s+"
-            r"([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)\s*…\s*([-+]?\d+(?:\.\d+)?)\s+"
-            r"([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)\s*…\s*([-+]?\d+(?:\.\d+)?)$",
-            line,
-            re.I,
-        )
-        if not m:
-            continue
-
-        cont_val = safe_float(m.group(1))
-        cont_low = safe_float(m.group(2))
-        cont_high = safe_float(m.group(3))
-        step_val = safe_float(m.group(4))
-        step_low = safe_float(m.group(5))
-        step_high = safe_float(m.group(6))
-
-        cont_mid = (cont_low + cont_high) / 2.0 if cont_low is not None and cont_high is not None else None
-        step_mid = (step_low + step_high) / 2.0 if step_low is not None and step_high is not None else None
-
-        if cont_val is not None and cont_mid is not None:
-            deviations.append(abs(cont_val - cont_mid))
-            if not value_in_range(cont_val, cont_low, cont_high):
-                failed_rows.append(f"Continuous move {cont_val} mm not in [{cont_low}, {cont_high}]")
-
-        if step_val is not None and step_mid is not None:
-            deviations.append(abs(step_val - step_mid))
-            if not value_in_range(step_val, step_low, step_high):
-                failed_rows.append(f"Stepwise move {step_val} mm not in [{step_low}, {step_high}]")
-
-    if not deviations:
-        return {
-            "test_name": "Table Positioning",
-            "value": None,
-            "unit": "mm",
-            "criteria": "All continuous and stepwise positions within stated tolerance",
-            "status": "FAIL",
-            "details": "Could not parse table positioning values.",
-        }
-
-    worst_dev = max(deviations)
-    return {
-        "test_name": "Table Positioning",
-        "value": worst_dev,
-        "unit": "mm",
-        "criteria": "All continuous and stepwise positions within stated tolerance",
-        "status": "PASS" if len(failed_rows) == 0 else "FAIL",
-        "details": (
-            f"Maximum absolute deviation from nominal midpoint: {worst_dev} mm."
-            + ("" if not failed_rows else " Failed rows: " + "; ".join(failed_rows[:10]))
-        ),
-    }
-
-
-def parse_ct_tube_voltage(text):
-    section = extract_section(
-        text,
-        "5 Tube Voltage (IEC Constancy)",
-        "6 Image Inspection (Constancy)",
-    )
-
-    if not section:
-        return {
-            "test_name": "Tube Voltage",
-            "value": None,
-            "unit": "kV",
-            "criteria": "All measured kV values within stated tolerance",
-            "status": "FAIL",
-            "details": "Tube Voltage section not found.",
-        }
-
-    lines = [x.strip() for x in section.splitlines() if x.strip()]
-    deviations = []
-    failed_rows = []
-
-    for line in lines:
-        m = re.match(
-            r"^([-+]?\d+(?:\.\d+)?)\s+[-+]?\d+(?:\.\d+)?\s+([-+]?\d+(?:\.\d+)?)\s+"
-            r"([-+]?\d+(?:\.\d+)?)\s*…\s*([-+]?\d+(?:\.\d+)?)\s+(In Tol\.|Out Tol\.)$",
-            line,
-            re.I,
-        )
-        if not m:
-            continue
-
-        nominal = safe_float(m.group(1))
-        measured = safe_float(m.group(2))
-        low = safe_float(m.group(3))
-        high = safe_float(m.group(4))
-        row_status = m.group(5)
-
-        if nominal is not None and measured is not None:
-            deviations.append(abs(measured - nominal))
-
-        if row_status.lower().startswith("out") or not value_in_range(measured, low, high):
-            failed_rows.append(f"{nominal} kV nominal, measured {measured} kV not in [{low}, {high}]")
-
-    if not deviations:
-        return {
-            "test_name": "Tube Voltage",
-            "value": None,
-            "unit": "kV",
-            "criteria": "All measured kV values within stated tolerance",
-            "status": "FAIL",
-            "details": "Could not parse tube voltage values.",
-        }
-
-    worst_dev = max(deviations)
-    return {
-        "test_name": "Tube Voltage",
-        "value": worst_dev,
-        "unit": "kV",
-        "criteria": "All measured kV values within stated tolerance",
-        "status": "PASS" if len(failed_rows) == 0 else "FAIL",
-        "details": (
-            f"Maximum absolute deviation from nominal tube voltage: {worst_dev} kV."
-            + ("" if not failed_rows else " Failed rows: " + "; ".join(failed_rows[:10]))
-        ),
-    }
-
-
-def parse_ct_image_inspection(text):
-    section = extract_section(
-        text,
-        "6 Image Inspection (Constancy)",
-        None,
-    )
-
-    if not section:
-        return {
-            "test_name": "Image Inspection",
-            "value": None,
-            "unit": "items",
-            "criteria": "All image inspection entries must be Accept",
-            "status": "FAIL",
-            "details": "Image Inspection section not found.",
-        }
-
-    accept_count = len(re.findall(r"\bAccept\b", section, re.I))
-    reject_like = re.findall(r"\b(Reject|Fail|Failed|Not Accept)\b", section, re.I)
-
-    if accept_count == 0 and not reject_like:
-        return {
-            "test_name": "Image Inspection",
-            "value": None,
-            "unit": "items",
-            "criteria": "All image inspection entries must be Accept",
-            "status": "FAIL",
-            "details": "Could not parse image inspection statuses.",
-        }
+def parse_ct_number(text):
+    m = re.search(r"Water CT Number:\s*([0-9.\-]+)", text)
+    val = safe_float(m.group(1)) if m else None
 
     return {
-        "test_name": "Image Inspection",
-        "value": accept_count,
-        "unit": "items",
-        "criteria": "All image inspection entries must be Accept",
-        "status": "PASS" if len(reject_like) == 0 else "FAIL",
-        "details": (
-            f"Accepted image inspection items: {accept_count}."
-            + ("" if not reject_like else f" Non-accept entries found: {reject_like}")
-        ),
+        "test_name": "CT Number Accuracy",
+        "value": val,
+        "unit": "HU",
+        "criteria": "0 ± 5 HU",
+        "status": "PASS" if val and abs(val) <= 5 else "FAIL",
+        "details": f"Water CT = {val} HU",
     }
 
 
-def infer_ct_parsers_from_pdf_text(text):
-    results = []
+def parse_mtf(text):
+    m = re.search(r"MTF 50%:\s*([0-9.\-]+)", text)
+    val = safe_float(m.group(1)) if m else None
 
-    results.append(parse_ct_homogeneity(text))
-    results.append(parse_ct_noise(text))
-    results.extend(parse_ct_mtf(text))
-    results.append(parse_ct_table_positioning(text))
-    results.append(parse_ct_tube_voltage(text))
-    results.append(parse_ct_image_inspection(text))
-
-    return results
-
-
-# =========================================================
-# GITHUB HELPERS
-# =========================================================
-def github_headers(token):
     return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
+        "test_name": "MTF 50%",
+        "value": val,
+        "unit": "lp/cm",
+        "criteria": "Trend",
+        "status": "PASS" if val else "FAIL",
+        "details": f"MTF50 = {val}",
     }
 
 
-def github_get_file(owner, repo, path, token, branch="main"):
-    try:
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        resp = requests.get(url, headers=github_headers(token), params={"ref": branch}, timeout=30)
-    except requests.RequestException as e:
-        return None, None, f"GitHub connection error: {e}"
-
-    if resp.status_code == 200:
-        payload = resp.json()
-        content = base64.b64decode(payload["content"]).decode("utf-8")
-        return content, payload.get("sha"), None
-
-    if resp.status_code == 404:
-        return None, None, None
-
-    return None, None, f"GitHub read error {resp.status_code}: {resp.text}"
-
-
-def github_put_file(owner, repo, path, token, content_text, message, branch="main", sha=None):
-    try:
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        payload = {
-            "message": message,
-            "content": base64.b64encode(content_text.encode("utf-8")).decode("utf-8"),
-            "branch": branch,
-        }
-        if sha:
-            payload["sha"] = sha
-
-        resp = requests.put(url, headers=github_headers(token), json=payload, timeout=30)
-    except requests.RequestException as e:
-        return False, f"GitHub connection error: {e}"
-
-    if resp.status_code in (200, 201):
-        return True, None
-
-    return False, f"GitHub write error {resp.status_code}: {resp.text}"
-
-
-def github_delete_file(owner, repo, path, token, message, branch="main", sha=None):
-    try:
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        payload = {
-            "message": message,
-            "branch": branch,
-            "sha": sha,
-        }
-        resp = requests.delete(url, headers=github_headers(token), json=payload, timeout=30)
-    except requests.RequestException as e:
-        return False, f"GitHub connection error: {e}"
-
-    if resp.status_code in (200, 204):
-        return True, None
-
-    return False, f"GitHub delete error {resp.status_code}: {resp.text}"
-
-
-def load_history_from_github(owner, repo, path, token, branch="main"):
-    content, sha, err = github_get_file(owner, repo, path, token, branch=branch)
-    if err:
-        return empty_history_df(), None, err
-
-    if content is None:
-        return empty_history_df(), None, None
-
-    try:
-        df = pd.read_csv(io.StringIO(content))
-    except Exception as e:
-        return empty_history_df(), None, f"Could not parse GitHub CSV: {e}"
-
-    return normalize_history_df(df), sha, None
-
-
-def save_history_to_github(df, owner, repo, path, token, branch="main", sha=None):
-    csv_text = normalize_history_df(df).to_csv(index=False)
-    ok, err = github_put_file(
-        owner=owner,
-        repo=repo,
-        path=path,
-        token=token,
-        content_text=csv_text,
-        message="Update CT QC history",
-        branch=branch,
-        sha=sha,
-    )
-    return ok, err
-
-
-# =========================================================
-# LOCKING
-# =========================================================
-def acquire_local_lock(lock_path=LOCAL_LOCK_FILE, timeout_seconds=20, stale_lock_seconds=300):
-    start = time.time()
-    while True:
-        if lock_path.exists():
-            age = time.time() - lock_path.stat().st_mtime
-            if age > stale_lock_seconds:
-                try:
-                    lock_path.unlink()
-                except Exception:
-                    pass
-
-        try:
-            with open(lock_path, "x", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "lock_id": str(uuid.uuid4()),
-                            "created_at": datetime.now().isoformat(timespec="seconds"),
-                        }
-                    )
-                )
-            return True
-        except FileExistsError:
-            pass
-        except Exception:
-            pass
-
-        if time.time() - start > timeout_seconds:
-            return False
-
-        time.sleep(0.5)
-
-
-def release_local_lock(lock_path=LOCAL_LOCK_FILE):
-    try:
-        if lock_path.exists():
-            lock_path.unlink()
-    except Exception:
-        pass
-
-
-def github_lock_path(csv_path):
-    csv_path = csv_path.strip("/")
-    if "/" in csv_path:
-        parent = csv_path.rsplit("/", 1)[0]
-        return f"{parent}/ct_qc_history.lock.json"
-    return "ct_qc_history.lock.json"
-
-
-def acquire_github_lock(owner, repo, csv_path, token, branch="main", timeout_seconds=25, stale_lock_seconds=300):
-    lock_path = github_lock_path(csv_path)
-    start = time.time()
-
-    while True:
-        content, sha, err = github_get_file(owner, repo, lock_path, token, branch=branch)
-        now = datetime.now()
-
-        if err:
-            return False, None, f"GitHub lock read error: {err}"
-
-        if content is not None:
-            try:
-                payload = json.loads(content)
-                created_at = datetime.fromisoformat(payload.get("created_at"))
-                if (now - created_at).total_seconds() > stale_lock_seconds:
-                    github_delete_file(
-                        owner=owner,
-                        repo=repo,
-                        path=lock_path,
-                        token=token,
-                        message="Remove stale CT QC lock",
-                        branch=branch,
-                        sha=sha,
-                    )
-                else:
-                    if time.time() - start > timeout_seconds:
-                        return False, None, "Could not acquire GitHub lock. Another user may be saving right now."
-                    time.sleep(1.0)
-                    continue
-            except Exception:
-                if time.time() - start > timeout_seconds:
-                    return False, None, "Could not interpret existing GitHub lock file."
-                time.sleep(1.0)
-                continue
-
-        lock_payload = json.dumps(
-            {
-                "lock_id": str(uuid.uuid4()),
-                "created_at": now.isoformat(timespec="seconds"),
-                "owner": owner,
-                "repo": repo,
-                "path": csv_path,
-            },
-            indent=2,
-        )
-
-        ok, _ = github_put_file(
-            owner=owner,
-            repo=repo,
-            path=lock_path,
-            token=token,
-            content_text=lock_payload,
-            message="Acquire CT QC lock",
-            branch=branch,
-            sha=None,
-        )
-
-        if ok:
-            _, latest_sha, latest_err = github_get_file(owner, repo, lock_path, token, branch=branch)
-            if latest_err:
-                return False, None, latest_err
-            return True, latest_sha, None
-
-        if time.time() - start > timeout_seconds:
-            return False, None, "Could not acquire GitHub lock. Another user may be saving right now."
-
-        time.sleep(1.0)
-
-
-def release_github_lock(owner, repo, csv_path, token, branch="main"):
-    lock_path = github_lock_path(csv_path)
-    content, sha, err = github_get_file(owner, repo, lock_path, token, branch=branch)
-    if err:
-        return False, err
-    if content is None or not sha:
-        return True, None
-
-    return github_delete_file(
-        owner=owner,
-        repo=repo,
-        path=lock_path,
-        token=token,
-        message="Release CT QC lock",
-        branch=branch,
-        sha=sha,
-    )
-
-
-# =========================================================
-# HISTORY STORAGE
-# =========================================================
-def load_history(local_only=True, github_cfg=None):
-    if not local_only and github_cfg:
-        return load_history_from_github(
-            github_cfg["owner"],
-            github_cfg["repo"],
-            github_cfg["path"],
-            github_cfg["token"],
-            branch=github_cfg["branch"],
-        )
-
-    if LOCAL_HISTORY_CSV.exists():
-        df = pd.read_csv(LOCAL_HISTORY_CSV)
-    else:
-        df = empty_history_df()
-
-    return normalize_history_df(df), None, None
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def cached_load_history(local_only=True, github_cfg=None):
-    return load_history(local_only=local_only, github_cfg=github_cfg)
-
-
-def save_history_local(df):
-    normalize_history_df(df).to_csv(LOCAL_HISTORY_CSV, index=False)
-
-
-def append_results_to_history(
-    results,
-    session_label,
-    timestamp,
-    site_name,
-    scanner_name,
-    scanner_id,
-    local_only=True,
-    github_cfg=None,
-    sha=None,
-):
-    history, _, _ = load_history(local_only=local_only, github_cfg=github_cfg)
-
-    rows = []
-    for r in results:
-        rows.append(
-            {
-                "timestamp": timestamp,
-                "session_label": session_label,
-                "site_name": site_name,
-                "scanner_name": scanner_name,
-                "scanner_id": scanner_id,
-                "test_name": r["test_name"],
-                "value": r["value"],
-                "unit": r["unit"],
-                "criteria": r["criteria"],
-                "status": r["status"],
-                "details": r["details"],
-                "source_file": r.get("source_file", ""),
-                "sequence_label": r.get("sequence_label", ""),
-            }
-        )
-
-    updated = pd.concat([history, pd.DataFrame(rows)], ignore_index=True)
-    updated = normalize_history_df(updated)
-
-    if local_only:
-        save_history_local(updated)
-        return updated, None, None
-
-    ok, err = save_history_to_github(
-        updated,
-        github_cfg["owner"],
-        github_cfg["repo"],
-        github_cfg["path"],
-        github_cfg["token"],
-        branch=github_cfg["branch"],
-        sha=sha,
-    )
-    return updated, ok, err
-
-
-def save_results_with_lock(
-    results,
-    session_label,
-    timestamp,
-    site_name,
-    scanner_name,
-    scanner_id,
-    local_only=True,
-    github_cfg=None,
-):
-    if local_only:
-        locked = acquire_local_lock()
-        if not locked:
-            return None, "Could not acquire local file lock. Please try again."
-        try:
-            updated, _, _ = append_results_to_history(
-                results,
-                session_label,
-                timestamp,
-                site_name,
-                scanner_name,
-                scanner_id,
-                local_only=True,
-                github_cfg=None,
-                sha=None,
-            )
-            return updated, None
-        finally:
-            release_local_lock()
-
-    ok, _, lock_err = acquire_github_lock(
-        github_cfg["owner"],
-        github_cfg["repo"],
-        github_cfg["path"],
-        github_cfg["token"],
-        branch=github_cfg["branch"],
-    )
-    if not ok:
-        return None, lock_err
-
-    try:
-        _, existing_sha, load_err = load_history(local_only=False, github_cfg=github_cfg)
-        if load_err:
-            return None, load_err
-
-        updated, _, save_err = append_results_to_history(
-            results,
-            session_label,
-            timestamp,
-            site_name,
-            scanner_name,
-            scanner_id,
-            local_only=False,
-            github_cfg=github_cfg,
-            sha=existing_sha,
-        )
-        if save_err:
-            return None, save_err
-
-        return updated, None
-    finally:
-        release_github_lock(
-            github_cfg["owner"],
-            github_cfg["repo"],
-            github_cfg["path"],
-            github_cfg["token"],
-            branch=github_cfg["branch"],
-        )
-
-
-# =========================================================
-# TREND DATA PREP
-# =========================================================
-def build_frontpage_trend_df(history_df, include_current_df=None):
-    trend_df = history_df.copy()
-
-    if include_current_df is not None and not include_current_df.empty:
-        trend_df = pd.concat([trend_df, include_current_df], ignore_index=True)
-
-    trend_df = normalize_history_df(trend_df)
-    if trend_df.empty:
-        return trend_df
-
-    trend_df["timestamp_dt"] = pd.to_datetime(trend_df["timestamp"], errors="coerce")
-    trend_df = trend_df.dropna(subset=["timestamp_dt"])
-
-    out = trend_df.sort_values(["scanner_id", "test_name", "timestamp_dt"]).reset_index(drop=True)
-    return out
-
-
-# =========================================================
-# PDF STYLES / HELPERS
-# =========================================================
-def get_pdf_styles():
-    styles = getSampleStyleSheet()
-
-    styles.add(
-        ParagraphStyle(
-            name="ReportTitleCustom",
-            parent=styles["Title"],
-            fontName="Helvetica-Bold",
-            fontSize=18,
-            leading=22,
-            alignment=TA_CENTER,
-            textColor=colors.HexColor("#183A63"),
-            spaceAfter=6,
-        )
-    )
-    styles.add(
-        ParagraphStyle(
-            name="ReportSubTitleCustom",
-            parent=styles["Normal"],
-            fontName="Helvetica",
-            fontSize=10,
-            leading=13,
-            alignment=TA_CENTER,
-            textColor=colors.HexColor("#4B5563"),
-            spaceAfter=8,
-            wordWrap="LTR",
-            splitLongWords=1,
-        )
-    )
-    styles.add(
-        ParagraphStyle(
-            name="SectionHeadingCustom",
-            parent=styles["Heading2"],
-            fontName="Helvetica-Bold",
-            fontSize=12,
-            leading=14,
-            alignment=TA_LEFT,
-            textColor=colors.HexColor("#183A63"),
-            spaceBefore=6,
-            spaceAfter=6,
-            wordWrap="LTR",
-            splitLongWords=1,
-        )
-    )
-    styles.add(
-        ParagraphStyle(
-            name="MetaCustom",
-            parent=styles["Normal"],
-            fontName="Helvetica",
-            fontSize=8.5,
-            leading=11,
-            alignment=TA_LEFT,
-            textColor=colors.black,
-            wordWrap="LTR",
-            splitLongWords=1,
-        )
-    )
-    styles.add(
-        ParagraphStyle(
-            name="TableCellCustom",
-            parent=styles["Normal"],
-            fontName="Helvetica",
-            fontSize=8,
-            leading=10,
-            alignment=TA_LEFT,
-            textColor=colors.black,
-            wordWrap="LTR",
-            splitLongWords=1,
-        )
-    )
-    styles.add(
-        ParagraphStyle(
-            name="TableHeaderCustom",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=8,
-            leading=10,
-            alignment=TA_LEFT,
-            textColor=colors.white,
-            wordWrap="LTR",
-            splitLongWords=1,
-        )
-    )
-    styles.add(
-        ParagraphStyle(
-            name="PassBadge",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=10,
-            alignment=TA_CENTER,
-            textColor=colors.HexColor("#166534"),
-        )
-    )
-    styles.add(
-        ParagraphStyle(
-            name="FailBadge",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=10,
-            alignment=TA_CENTER,
-            textColor=colors.HexColor("#991B1B"),
-        )
-    )
-
-    return styles
-
-
-def add_pdf_header(elements, styles, title, subtitle="", site_name="", scanner_name="", include_logo=True):
-    if include_logo and LOGO_PATH.exists():
-        try:
-            logo = RLImage(str(LOGO_PATH), width=110, height=40)
-            elements.append(logo)
-            elements.append(Spacer(1, 6))
-        except Exception:
-            pass
-
-    elements.append(Paragraph(title, styles["ReportTitleCustom"]))
-    if subtitle:
-        elements.append(Paragraph(subtitle, styles["ReportSubTitleCustom"]))
-    if site_name or scanner_name:
-        meta_line = " | ".join([x for x in [site_name, scanner_name] if x])
-        if meta_line:
-            elements.append(Paragraph(meta_line, styles["ReportSubTitleCustom"]))
-    elements.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#CBD5E1")))
-    elements.append(Spacer(1, 8))
-
-
-def status_paragraph(status, styles):
-    s = str(status).upper().strip()
-    if s == "PASS":
-        return Paragraph("PASS", styles["PassBadge"])
-    return Paragraph("FAIL", styles["FailBadge"])
-
-
-def format_value_unit(value, unit):
-    if pd.isna(value):
-        return ""
-    try:
-        if float(value).is_integer():
-            value = int(value)
-    except Exception:
-        pass
-    return f"{value} {unit}".strip()
-
-
-def format_session_date(ts):
-    ts = str(ts)
-    return ts.split("T")[0] if ts else ""
-
-
-def build_results_table(results_df, styles):
-    df = normalize_history_df(results_df).copy()
-    df = sort_tests_ct(df)
-
-    cell_style = styles["TableCellCustom"]
-    header_style = styles["TableHeaderCustom"]
-
-    table_data = [[
-        Paragraph("Test", header_style),
-        Paragraph("Value", header_style),
-        Paragraph("Tolerance", header_style),
-        Paragraph("Status", header_style),
-    ]]
-
-    for _, row in df.iterrows():
-        value_text = format_value_unit(row["value"], row["unit"])
-        criteria_text = str(row["criteria"]) if pd.notna(row["criteria"]) else ""
-        test_text = str(row["test_name"]) if pd.notna(row["test_name"]) else ""
-
-        table_data.append([
-            Paragraph(test_text, cell_style),
-            Paragraph(value_text, cell_style),
-            Paragraph(criteria_text, cell_style),
-            status_paragraph(row["status"], styles),
-        ])
-
-    table = Table(
-        table_data,
-        colWidths=[170, 80, 210, 50],
-        repeatRows=1,
-        splitByRow=1,
-    )
-
-    ts = TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#9CA3AF")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#EEF3F8")]),
-    ])
-
-    for idx, (_, row) in enumerate(df.iterrows(), start=1):
-        if str(row["status"]).upper() == "PASS":
-            ts.add("BACKGROUND", (3, idx), (3, idx), colors.HexColor("#DCFCE7"))
-        else:
-            ts.add("BACKGROUND", (3, idx), (3, idx), colors.HexColor("#FEE2E2"))
-
-    table.setStyle(ts)
-    return table
-
-
-def fig_to_rl_image(fig, width=500):
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=160)
-    buf.seek(0)
-    img_reader = ImageReader(buf)
-    iw, ih = img_reader.getSize()
-    aspect = ih / float(iw) if iw else 0.58
-    return RLImage(buf, width=width, height=width * aspect)
-
-
-def add_reference_lines_ct(ax, selected_test):
-    if selected_test == "Homogeneity":
-        ax.axhline(4.0, linestyle="--", alpha=0.7)
-        ax.axhline(-4.0, linestyle="--", alpha=0.7)
-    elif selected_test == "MTF 50%":
-        ax.axhline(3.13, linestyle="--", alpha=0.7)
-        ax.axhline(3.83, linestyle="--", alpha=0.7)
-    elif selected_test == "MTF 10%":
-        ax.axhline(5.71, linestyle="--", alpha=0.7)
-        ax.axhline(6.97, linestyle="--", alpha=0.7)
-    elif selected_test == "Table Positioning":
-        ax.axhline(1.0, linestyle="--", alpha=0.7)
-    elif selected_test == "Tube Voltage":
-        ax.axhline(0.0, linestyle="--", alpha=0.4)
-
-
-def create_trend_chart(df, test_name):
-    sub = build_frontpage_trend_df(df)
-    if sub.empty:
-        return None, None
-
-    sub = sub[sub["test_name"] == test_name].copy()
-    sub = sub.dropna(subset=["timestamp_dt", "value"]).sort_values("timestamp_dt")
-    if sub.empty:
-        return None, None
-
-    fig, ax = plt.subplots(figsize=(8, 4.2))
-    ax.plot(sub["timestamp_dt"], sub["value"], marker="o")
-    ax.set_title(test_name)
-    unit = sub["unit"].dropna().iloc[0] if not sub["unit"].dropna().empty else ""
-    ax.set_xlabel("Timestamp")
-    ax.set_ylabel(f"Value ({unit})")
-    ax.grid(True, alpha=0.3)
-    add_reference_lines_ct(ax, test_name)
-    fig.autofmt_xdate()
-
-    chart_path = CHARTS_DIR / f"{test_name.replace('/', '_').replace(' ', '_')}.png"
-    fig.savefig(chart_path, bbox_inches="tight", dpi=160)
-    return fig, chart_path
-
-
-def build_pdf_report(
-    results_df,
-    history_df,
-    site_name,
-    scanner_name,
-    session_label,
-    timestamp_str,
-):
-    safe_scanner = sanitize_filename(scanner_name or "scanner")
-    safe_date = format_session_date(timestamp_str) or datetime.now().strftime("%Y-%m-%d")
-    pdf_path = REPORTS_DIR / f"CT_QC_Report_{safe_scanner}_{safe_date}.pdf"
-
-    doc = SimpleDocTemplate(
-        str(pdf_path),
-        pagesize=A4,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=30,
-        bottomMargin=30,
-    )
-    styles = get_pdf_styles()
-    elements = []
-
-    results_df = normalize_history_df(results_df).copy()
-    results_df = sort_tests_ct(results_df)
-
-    add_pdf_header(
-        elements,
-        styles,
-        title="CT IEC Constancy QC Compliance Report",
-        subtitle="Formal session summary with parsed measurements and trend review",
-        site_name=site_name,
-        scanner_name=scanner_name,
-        include_logo=True,
-    )
-
-    elements.append(Paragraph("Session Information", styles["SectionHeadingCustom"]))
-    elements.append(Paragraph(f"<b>Session label:</b> {session_label}", styles["MetaCustom"]))
-    elements.append(Paragraph(f"<b>Timestamp:</b> {timestamp_str}", styles["MetaCustom"]))
-    elements.append(Paragraph(f"<b>Session date:</b> {format_session_date(timestamp_str)}", styles["MetaCustom"]))
-    elements.append(Spacer(1, 8))
-
-    overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
-    overall_color = "#166534" if overall == "PASS" else "#991B1B"
-    elements.append(
-        Paragraph(
-            f'<font color="{overall_color}"><b>Overall result: {overall}</b></font>',
-            styles["SectionHeadingCustom"],
-        )
-    )
-    elements.append(Spacer(1, 4))
-
-    elements.append(Paragraph("Session Results Summary", styles["SectionHeadingCustom"]))
-    elements.append(build_results_table(results_df, styles))
-    elements.append(Spacer(1, 12))
-
-    elements.append(Paragraph("Parsed Details", styles["SectionHeadingCustom"]))
-    for _, row in results_df.iterrows():
-        label_bits = [x for x in [row["test_name"], row.get("source_file", ""), row.get("sequence_label", "")] if str(x).strip()]
-        label = " | ".join(label_bits)
-        elements.append(Paragraph(f"<b>{label}:</b> {row['details']}", styles["MetaCustom"]))
-        elements.append(Spacer(1, 4))
-
-    elements.append(Spacer(1, 8))
-    elements.append(Paragraph("Trend Charts", styles["SectionHeadingCustom"]))
-    added_any_chart = False
-
-    for test_name in results_df["test_name"].tolist():
-        fig, _ = create_trend_chart(history_df, test_name)
-        if fig is not None:
-            added_any_chart = True
-            elements.append(Spacer(1, 6))
-            elements.append(Paragraph(test_name, styles["MetaCustom"]))
-            elements.append(fig_to_rl_image(fig, width=500))
-            plt.close(fig)
-            elements.append(Spacer(1, 8))
-
-    if not added_any_chart:
-        elements.append(Paragraph("No historical numeric data yet for trend charts.", styles["MetaCustom"]))
-
-    doc.build(elements)
-    return pdf_path
-
-
-def build_session_summary_pdf(history_df, site_name=None, scanner_name=None, scanner_id=None):
-    scanner_fragment = sanitize_filename(scanner_name or scanner_id or "scanner")
-    pdf_path = REPORTS_DIR / f"CT_QC_Session_Summary_{scanner_fragment}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-
-    doc = SimpleDocTemplate(
-        str(pdf_path),
-        pagesize=A4,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=30,
-        bottomMargin=30,
-    )
-
-    styles = get_pdf_styles()
-    elements = []
-
-    df = normalize_history_df(history_df).copy()
-    if df.empty:
-        add_pdf_header(
-            elements,
-            styles,
-            title="CT IEC Constancy QC Session Summary",
-            subtitle="Historical report",
-            site_name=site_name or "",
-            scanner_name=scanner_name or "",
-            include_logo=True,
-        )
-        elements.append(Paragraph("No history data available.", styles["MetaCustom"]))
-        doc.build(elements)
-        return pdf_path
-
-    if scanner_id:
-        df = df[df["scanner_id"] == scanner_id].copy()
-    else:
-        if site_name:
-            df = df[df["site_name"] == site_name].copy()
-        if scanner_name:
-            df = df[df["scanner_name"] == scanner_name].copy()
-
-    if df.empty:
-        add_pdf_header(
-            elements,
-            styles,
-            title="CT IEC Constancy QC Session Summary",
-            subtitle="Historical report",
-            site_name=site_name or "",
-            scanner_name=scanner_name or "",
-            include_logo=True,
-        )
-        elements.append(Paragraph("No matching session history found for the selected scanner.", styles["MetaCustom"]))
-        doc.build(elements)
-        return pdf_path
-
-    df["timestamp_dt"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    df = df.sort_values("timestamp_dt", ascending=False)
-
-    add_pdf_header(
-        elements,
-        styles,
-        title="CT IEC Constancy QC Session Summary",
-        subtitle="All recorded sessions for the selected system",
-        site_name=site_name or "",
-        scanner_name=scanner_name or "",
-        include_logo=True,
-    )
-
-    group_cols = ["timestamp", "session_label", "site_name", "scanner_name", "scanner_id"]
-    grouped_items = list(df.groupby(group_cols, sort=False))
-
-    for idx, ((timestamp, session_label, g_site, g_scanner, g_scanner_id), g) in enumerate(grouped_items):
-        g = sort_tests_ct(g.copy())
-        overall = "PASS" if (g["status"] == "PASS").all() else "FAIL"
-        overall_color = "#166534" if overall == "PASS" else "#991B1B"
-
-        elements.append(Paragraph(f"Session {idx + 1}", styles["SectionHeadingCustom"]))
-        elements.append(Paragraph(f"<b>Session date:</b> {format_session_date(timestamp)}", styles["MetaCustom"]))
-        elements.append(Paragraph(f"<b>Timestamp:</b> {timestamp}", styles["MetaCustom"]))
-        elements.append(Paragraph(f"<b>Session label:</b> {session_label}", styles["MetaCustom"]))
-        elements.append(Paragraph(f"<b>Site:</b> {g_site}", styles["MetaCustom"]))
-        elements.append(Paragraph(f"<b>Scanner:</b> {g_scanner}", styles["MetaCustom"]))
-        elements.append(Paragraph(f"<b>System ID:</b> {g_scanner_id}", styles["MetaCustom"]))
-        elements.append(
-            Paragraph(
-                f'<font color="{overall_color}"><b>Overall result:</b> {overall}</font>',
-                styles["MetaCustom"],
-            )
-        )
-        elements.append(Spacer(1, 8))
-        elements.append(build_results_table(g, styles))
-
-        if idx < len(grouped_items) - 1:
-            elements.append(PageBreak())
-
-    doc.build(elements)
-    return pdf_path
-
-
-def build_single_session_pdf(session_df):
-    pdf_path = REPORTS_DIR / f"CT_QC_Selected_Session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-
-    doc = SimpleDocTemplate(
-        str(pdf_path),
-        pagesize=A4,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=30,
-        bottomMargin=30,
-    )
-
-    styles = get_pdf_styles()
-    elements = []
-
-    df = normalize_history_df(session_df).copy()
-    df = sort_tests_ct(df)
-
-    if df.empty:
-        add_pdf_header(
-            elements,
-            styles,
-            title="CT IEC Constancy QC Session Report",
-            subtitle="Selected historical session",
-            include_logo=True,
-        )
-        elements.append(Paragraph("No data found for the selected session.", styles["MetaCustom"]))
-        doc.build(elements)
-        return pdf_path
-
-    first = df.iloc[0]
-    overall = "PASS" if (df["status"] == "PASS").all() else "FAIL"
-    overall_color = "#166534" if overall == "PASS" else "#991B1B"
-
-    add_pdf_header(
-        elements,
-        styles,
-        title="CT IEC Constancy QC Session Report",
-        subtitle="Formal single-session report generated from stored history",
-        site_name=str(first["site_name"]),
-        scanner_name=str(first["scanner_name"]),
-        include_logo=True,
-    )
-
-    elements.append(Paragraph("Session Information", styles["SectionHeadingCustom"]))
-    elements.append(Paragraph(f"<b>Session date:</b> {format_session_date(first['timestamp'])}", styles["MetaCustom"]))
-    elements.append(Paragraph(f"<b>Timestamp:</b> {first['timestamp']}", styles["MetaCustom"]))
-    elements.append(Paragraph(f"<b>Session label:</b> {first['session_label']}", styles["MetaCustom"]))
-    elements.append(Paragraph(f"<b>System ID:</b> {first['scanner_id']}", styles["MetaCustom"]))
-    elements.append(Spacer(1, 8))
-
-    elements.append(
-        Paragraph(
-            f'<font color="{overall_color}"><b>Overall result: {overall}</b></font>',
-            styles["SectionHeadingCustom"],
-        )
-    )
-    elements.append(Spacer(1, 6))
-
-    elements.append(Paragraph("Results Summary", styles["SectionHeadingCustom"]))
-    elements.append(build_results_table(df, styles))
-    elements.append(Spacer(1, 12))
-
-    elements.append(Paragraph("Details", styles["SectionHeadingCustom"]))
-    for _, row in df.iterrows():
-        elements.append(Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["MetaCustom"]))
-        elements.append(Spacer(1, 4))
-
-    doc.build(elements)
-    return pdf_path
+def infer_parser(text):
+    if "Uniformity" in text:
+        return parse_uniformity(text)
+    if "Noise" in text:
+        return parse_noise(text)
+    if "Water CT" in text:
+        return parse_ct_number(text)
+    if "MTF" in text:
+        return parse_mtf(text)
+
+    return {
+        "test_name": "Unknown",
+        "value": None,
+        "unit": "",
+        "criteria": "",
+        "status": "FAIL",
+        "details": "Could not parse",
+    }
 
 
 # =========================================================
@@ -1721,520 +166,83 @@ def build_single_session_pdf(session_df):
 # =========================================================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption(
-    "Upload one Siemens IEC Constancy PDF, auto-evaluate pass/fail, "
-    "save history with timestamp, and generate PDF reports from current or historical sessions."
-)
 
-if "session_saved" not in st.session_state:
-    st.session_state.session_saved = False
-
-if "parsed_results" not in st.session_state:
-    st.session_state.parsed_results = []
-
-if "combined_results" not in st.session_state:
-    st.session_state.combined_results = []
-
-if "last_upload_signature" not in st.session_state:
-    st.session_state.last_upload_signature = None
-
-if "pdf_report_bytes" not in st.session_state:
-    st.session_state.pdf_report_bytes = None
-    st.session_state.pdf_report_name = None
-
-if "summary_pdf_bytes" not in st.session_state:
-    st.session_state.summary_pdf_bytes = None
-    st.session_state.summary_pdf_name = None
-
-if "selected_session_pdf_bytes" not in st.session_state:
-    st.session_state.selected_session_pdf_bytes = None
-    st.session_state.selected_session_pdf_name = None
-
-try:
-    SECRET_GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
-except Exception:
-    SECRET_GITHUB_TOKEN = ""
-
-try:
-    repo_full = st.secrets["GITHUB_REPO"]
-    owner, repo_name = repo_full.split("/", 1)
-except Exception:
-    owner = DEFAULT_GITHUB_OWNER
-    repo_name = DEFAULT_GITHUB_REPO
-
-try:
-    github_branch = st.secrets["GITHUB_BRANCH"]
-except Exception:
-    github_branch = DEFAULT_GITHUB_BRANCH
-
-github_cfg = {
-    "owner": owner,
-    "repo": repo_name,
-    "branch": github_branch,
-    "path": DEFAULT_GITHUB_CSV_PATH,
-    "token": SECRET_GITHUB_TOKEN,
-}
-USE_GITHUB = github_is_ready(github_cfg)
-
-history_df, _, preload_err = cached_load_history(
-    local_only=not USE_GITHUB,
-    github_cfg=github_cfg if USE_GITHUB else None,
-)
-if preload_err:
-    st.error(preload_err)
-    history_df = empty_history_df()
-
-history_df = normalize_history_df(history_df)
-known_sites = sorted([x for x in history_df["site_name"].unique().tolist() if x])
-
-uploaded_file = st.file_uploader(
-    "Upload Siemens IEC Constancy PDF",
-    type=["pdf"],
-    accept_multiple_files=False,
-)
-
-pdf_text = ""
-pdf_meta = {
-    "site_name": "",
-    "scanner_name": "",
-    "serial_number": "",
-    "timestamp_iso": "",
-}
-
-if uploaded_file:
-    try:
-        pdf_text = read_pdf_text(uploaded_file)
-        pdf_meta = extract_pdf_metadata(pdf_text)
-    except Exception as e:
-        st.error(f"Could not read PDF: {e}")
-        st.stop()
-
+# Sidebar
 with st.sidebar:
-    st.header("Session info")
+    site = st.text_input("Site")
+    scanner = st.text_input("Scanner")
+    session_label = st.text_input("Session", "Daily QC")
 
-    suggested_site = pdf_meta.get("site_name", "") if uploaded_file else ""
-    suggested_scanner = pdf_meta.get("scanner_name", "") if uploaded_file else ""
-    suggested_timestamp = pdf_meta.get("timestamp_iso", "") if uploaded_file else ""
+scanner_id = build_scanner_id(site, scanner)
+timestamp = datetime.now().isoformat()
 
-    if known_sites:
-        site_mode = st.radio("Site entry mode", ["Select existing", "Enter new"], horizontal=False)
-        if site_mode == "Select existing":
-            default_site_index = 0
-            if suggested_site and suggested_site in known_sites:
-                default_site_index = known_sites.index(suggested_site)
-            site_name = st.selectbox("Site / Hospital", options=known_sites, index=default_site_index)
-        else:
-            site_name = st.text_input("Site / Hospital", value=suggested_site)
-    else:
-        site_name = st.text_input("Site / Hospital", value=suggested_site)
-
-    filtered_scanners = []
-    if site_name.strip():
-        filtered_scanners = sorted(
-            [
-                x
-                for x in history_df.loc[history_df["site_name"] == site_name.strip(), "scanner_name"]
-                .dropna()
-                .astype(str)
-                .unique()
-                .tolist()
-                if x
-            ]
-        )
-
-    if suggested_scanner and suggested_scanner not in filtered_scanners and suggested_scanner.strip():
-        filtered_scanners = sorted(filtered_scanners + [suggested_scanner])
-
-    if filtered_scanners:
-        scanner_mode = st.radio("Scanner entry mode", ["Select existing", "Enter new"], horizontal=False)
-        if scanner_mode == "Select existing":
-            default_scanner_index = 0
-            if suggested_scanner and suggested_scanner in filtered_scanners:
-                default_scanner_index = filtered_scanners.index(suggested_scanner)
-            scanner_name = st.selectbox("Scanner / System", options=filtered_scanners, index=default_scanner_index)
-        else:
-            scanner_name = st.text_input("Scanner / System", value=suggested_scanner)
-    else:
-        scanner_name = st.text_input("Scanner / System", value=suggested_scanner)
-
-    scanner_id = build_scanner_id(site_name, scanner_name)
-    st.caption(f"System ID: {scanner_id}")
-
-    default_label = "IEC Constancy QC"
-    session_label = st.text_input("Session label", value=default_label)
-
-    timestamp_default = suggested_timestamp or datetime.now().isoformat(timespec="seconds")
-    custom_timestamp = st.text_input("Timestamp (optional, ISO format)", value=timestamp_default)
-
-    if custom_timestamp.strip():
-        if not validate_iso_timestamp(custom_timestamp.strip()):
-            st.error("Timestamp must be valid ISO format, e.g. 2026-04-02T14:16:35")
-            st.stop()
-        timestamp_str = custom_timestamp.strip()
-    else:
-        timestamp_str = datetime.now().isoformat(timespec="seconds")
-
-    if uploaded_file and pdf_meta.get("serial_number"):
-        st.caption(f"PDF Serial Number: {pdf_meta['serial_number']}")
-
-    if USE_GITHUB:
-        st.success("GitHub history storage is active.")
-    else:
-        st.warning("GitHub not fully configured. Using local history file.")
-
-current_upload_signature = (
-    uploaded_file.name if uploaded_file else "",
-    site_name.strip(),
-    scanner_name.strip(),
-    session_label.strip(),
-    timestamp_str.strip(),
+uploaded_files = st.file_uploader(
+    "Upload CT result files", type=["txt"], accept_multiple_files=True
 )
 
-if st.session_state.last_upload_signature != current_upload_signature:
-    st.session_state.session_saved = False
-    st.session_state.last_upload_signature = current_upload_signature
+history_df = load_history()
 
-parsed_results = []
-results_df = pd.DataFrame()
-
-if uploaded_file:
-    with st.spinner("Parsing IEC Constancy PDF..."):
-        parsed_results = infer_ct_parsers_from_pdf_text(pdf_text)
-
-    for r in parsed_results:
-        r["source_file"] = uploaded_file.name
-        r["sequence_label"] = "CT_IEC_CONSTANCY"
-
-    st.session_state.parsed_results = parsed_results
-    st.session_state.combined_results = parsed_results
-
-    results_df = pd.DataFrame(parsed_results)
-    results_df = sort_tests_ct(results_df)
-
-    st.subheader("Current CT session results")
-    display_cols = [
-        c for c in
-        ["source_file", "sequence_label", "test_name", "value", "unit", "criteria", "status", "details"]
-        if c in results_df.columns
-    ]
-    st.dataframe(results_df[display_cols], use_container_width=True)
-
-    overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
-    st.metric("Overall session result", overall)
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        if st.button("Save session to history", type="primary", key="save_session_to_history"):
-            if not site_name.strip() or not scanner_name.strip():
-                st.error("Please enter both Site / Hospital and Scanner / System.")
-            else:
-                history_after_save, save_err = save_results_with_lock(
-                    parsed_results,
-                    session_label,
-                    timestamp_str,
-                    site_name,
-                    scanner_name,
-                    scanner_id,
-                    local_only=not USE_GITHUB,
-                    github_cfg=github_cfg if USE_GITHUB else None,
-                )
-                if save_err:
-                    st.error(save_err)
-                else:
-                    st.session_state.session_saved = True
-                    history_df = normalize_history_df(history_after_save)
-                    cached_load_history.clear()
-                    st.success(f"Saved {len(parsed_results)} CT QC results to history for system: {scanner_id}")
-
-    with col2:
-        if st.button("Generate PDF report", key="generate_pdf_report"):
-            if not site_name.strip() or not scanner_name.strip():
-                st.error("Please enter both Site / Hospital and Scanner / System.")
-            else:
-                temp_history = history_df.copy()
-                if uploaded_file and parsed_results:
-                    current_rows = pd.DataFrame(
-                        [
-                            {
-                                "timestamp": timestamp_str,
-                                "session_label": session_label,
-                                "site_name": site_name,
-                                "scanner_name": scanner_name,
-                                "scanner_id": scanner_id,
-                                "test_name": r["test_name"],
-                                "value": r["value"],
-                                "unit": r["unit"],
-                                "criteria": r["criteria"],
-                                "status": r["status"],
-                                "details": r["details"],
-                                "source_file": r.get("source_file", ""),
-                                "sequence_label": r.get("sequence_label", ""),
-                            }
-                            for r in parsed_results
-                        ]
-                    )
-                    temp_history = pd.concat([temp_history, current_rows], ignore_index=True)
-                    temp_history = normalize_history_df(temp_history)
-
-                pdf_path = build_pdf_report(
-                    results_df=results_df,
-                    history_df=temp_history,
-                    site_name=site_name,
-                    scanner_name=scanner_name,
-                    session_label=session_label,
-                    timestamp_str=timestamp_str,
-                )
-
-                with open(pdf_path, "rb") as f:
-                    st.session_state.pdf_report_bytes = f.read()
-                    st.session_state.pdf_report_name = pdf_path.name
-
-                st.success(f"PDF report created: {pdf_path.name}")
-
-    with col3:
-        if st.button("Generate session summary PDF", key="generate_session_summary_pdf"):
-            if not site_name.strip() or not scanner_name.strip():
-                st.error("Please enter both Site / Hospital and Scanner / System.")
-            else:
-                summary_history = history_df.copy()
-
-                if uploaded_file and parsed_results and not st.session_state.session_saved:
-                    current_rows = pd.DataFrame(
-                        [
-                            {
-                                "timestamp": timestamp_str,
-                                "session_label": session_label,
-                                "site_name": site_name,
-                                "scanner_name": scanner_name,
-                                "scanner_id": scanner_id,
-                                "test_name": r["test_name"],
-                                "value": r["value"],
-                                "unit": r["unit"],
-                                "criteria": r["criteria"],
-                                "status": r["status"],
-                                "details": r["details"],
-                                "source_file": r.get("source_file", ""),
-                                "sequence_label": r.get("sequence_label", ""),
-                            }
-                            for r in parsed_results
-                        ]
-                    )
-                    summary_history = pd.concat([summary_history, current_rows], ignore_index=True)
-                    summary_history = normalize_history_df(summary_history)
-
-                pdf_path = build_session_summary_pdf(
-                    summary_history,
-                    site_name=site_name,
-                    scanner_name=scanner_name,
-                    scanner_id=scanner_id,
-                )
-
-                with open(pdf_path, "rb") as f:
-                    st.session_state.summary_pdf_bytes = f.read()
-                    st.session_state.summary_pdf_name = pdf_path.name
-
-                st.success(f"Session summary PDF created: {pdf_path.name}")
-
-    if st.session_state.pdf_report_bytes:
-        st.download_button(
-            "Download PDF report",
-            data=st.session_state.pdf_report_bytes,
-            file_name=st.session_state.pdf_report_name,
-            mime="application/pdf",
-            key="download_pdf_report",
-        )
-
-    if st.session_state.summary_pdf_bytes:
-        st.download_button(
-            "Download session summary PDF",
-            data=st.session_state.summary_pdf_bytes,
-            file_name=st.session_state.summary_pdf_name,
-            mime="application/pdf",
-            key="download_summary_pdf",
-        )
-
-else:
-    parsed_results = st.session_state.get("parsed_results", [])
-    if parsed_results:
-        results_df = pd.DataFrame(parsed_results)
-        results_df = sort_tests_ct(results_df)
+results = []
 
 # =========================================================
-# TREND DATA PREP
+# PARSE FILES
 # =========================================================
-history_df, _, load_err = cached_load_history(
-    local_only=not USE_GITHUB,
-    github_cfg=github_cfg if USE_GITHUB else None,
-)
-if load_err:
-    st.error(load_err)
-    history_df = empty_history_df()
+if uploaded_files:
+    for f in uploaded_files:
+        text = f.read().decode("utf-8", errors="ignore")
+        res = infer_parser(text)
+        results.append(res)
 
-history_df = normalize_history_df(history_df)
+    df = pd.DataFrame(results)
+    st.subheader("Results")
+    st.dataframe(df, width="stretch")
 
-current_rows_df = pd.DataFrame()
-if uploaded_file and parsed_results and not st.session_state.session_saved:
-    current_rows_df = pd.DataFrame(
-        [
-            {
-                "timestamp": timestamp_str,
-                "session_label": session_label,
-                "site_name": site_name,
-                "scanner_name": scanner_name,
-                "scanner_id": scanner_id,
-                "test_name": r["test_name"],
-                "value": r["value"],
-                "unit": r["unit"],
-                "criteria": r["criteria"],
-                "status": r["status"],
-                "details": r["details"],
-                "source_file": r.get("source_file", ""),
-                "sequence_label": r.get("sequence_label", ""),
-            }
-            for r in parsed_results
-        ]
-    )
+    overall = "PASS" if (df["status"] == "PASS").all() else "FAIL"
+    st.metric("Overall", overall)
 
-front_trend_df = build_frontpage_trend_df(history_df, include_current_df=current_rows_df)
-
-# =========================================================
-# FRONT PAGE SINGLE TREND PANEL
-# =========================================================
-st.subheader("Trend preview")
-
-if front_trend_df.empty:
-    st.info("No trend data available yet.")
-else:
-    panel_col1, panel_col2 = st.columns(2)
-
-    system_options = sorted(front_trend_df["scanner_id"].dropna().astype(str).unique().tolist())
-
-    with panel_col1:
-        default_idx = 0
-        if scanner_id in system_options:
-            default_idx = system_options.index(scanner_id)
-
-        selected_system = st.selectbox(
-            "Select system",
-            system_options,
-            index=default_idx,
-            key="front_system_select",
-        )
-
-    system_df = front_trend_df[front_trend_df["scanner_id"] == selected_system].copy()
-    system_df = sort_tests_ct(system_df)
-
-    test_options = system_df["test_name"].dropna().astype(str).unique().tolist()
-    test_options = sorted(test_options, key=ct_sort_key)
-
-    with panel_col2:
-        selected_test = st.selectbox(
-            "Select test",
-            test_options,
-            key="front_test_select",
-        )
-
-    timestamp_options = (
-        history_df.loc[history_df["scanner_id"] == selected_system, "timestamp"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-    timestamp_options = sorted(timestamp_options, reverse=True)
-
-    if timestamp_options:
-        selected_timestamp = st.selectbox(
-            "Select session timestamp",
-            timestamp_options,
-            key="front_timestamp_select",
-        )
-    else:
-        selected_timestamp = None
-        st.info("No saved session timestamps available for the selected system.")
-
-    plot_df = system_df[system_df["test_name"] == selected_test].copy().sort_values("timestamp_dt")
-    plot_df = plot_df.dropna(subset=["timestamp_dt", "value"])
-
-    if plot_df.empty:
-        st.warning("No data available for this selection.")
-    else:
-        latest = plot_df.iloc[-1]["value"]
-        mean_val = plot_df["value"].mean()
-        min_val = plot_df["value"].min()
-        max_val = plot_df["value"].max()
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Latest", f"{latest:.3f}")
-        m2.metric("Mean", f"{mean_val:.3f}")
-        m3.metric("Min", f"{min_val:.3f}")
-        m4.metric("Max", f"{max_val:.3f}")
-
-        fig, ax = plt.subplots(figsize=(9, 4.2))
-        ax.plot(plot_df["timestamp_dt"], plot_df["value"], marker="o")
-        unit = plot_df["unit"].dropna().iloc[0] if not plot_df["unit"].dropna().empty else ""
-        ax.set_title(f"{selected_test} | {selected_system}")
-        ax.set_xlabel("Timestamp")
-        ax.set_ylabel(f"Value ({unit})")
-        ax.grid(True, alpha=0.3)
-        add_reference_lines_ct(ax, selected_test)
-        fig.autofmt_xdate()
-        st.pyplot(fig)
-        plt.close(fig)
-
-        with st.expander("Show trend data table"):
-            st.dataframe(
-                plot_df[
-                    [
-                        "timestamp",
-                        "site_name",
-                        "scanner_name",
-                        "scanner_id",
-                        "session_label",
-                        "test_name",
-                        "value",
-                        "unit",
-                        "status",
-                        "details",
-                    ]
-                ],
-                use_container_width=True,
+    # SAVE
+    if st.button("Save Session"):
+        rows = []
+        for r in results:
+            rows.append(
+                {
+                    "timestamp": timestamp,
+                    "site_name": site,
+                    "scanner_name": scanner,
+                    "scanner_id": scanner_id,
+                    "test_name": r["test_name"],
+                    "value": r["value"],
+                    "unit": r["unit"],
+                    "criteria": r["criteria"],
+                    "status": r["status"],
+                    "details": r["details"],
+                }
             )
 
-        csv_bytes = plot_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download trend CSV",
-            data=csv_bytes,
-            file_name=f"{selected_test}_{selected_system}_trend.csv".replace(" ", "_").replace("/", "_"),
-            mime="text/csv",
-            key="download_trend_csv",
-        )
+        history_df = pd.concat([history_df, pd.DataFrame(rows)])
+        save_history(history_df)
 
-    st.subheader("Print selected session")
+        st.success("Saved to history")
 
-    if st.button("Generate PDF for selected session", key="front_selected_session_pdf"):
-        if not selected_system or not selected_timestamp:
-            st.error("Please select system and session timestamp.")
-        else:
-            session_df = build_single_session_df(history_df, selected_system, selected_timestamp)
 
-            if session_df.empty:
-                st.warning("No data found for selected session.")
-            else:
-                pdf_path = build_single_session_pdf(session_df)
+# =========================================================
+# TREND
+# =========================================================
+st.subheader("Trend")
 
-                with open(pdf_path, "rb") as f:
-                    st.session_state.selected_session_pdf_bytes = f.read()
-                    st.session_state.selected_session_pdf_name = pdf_path.name
+if not history_df.empty:
+    tests = history_df["test_name"].unique().tolist()
 
-                st.success(f"Selected session PDF created: {pdf_path.name}")
+    selected_test = st.selectbox("Select test", tests)
 
-    if st.session_state.selected_session_pdf_bytes:
-        st.download_button(
-            "Download selected session PDF",
-            data=st.session_state.selected_session_pdf_bytes,
-            file_name=st.session_state.selected_session_pdf_name,
-            mime="application/pdf",
-            key="front_selected_session_pdf_download",
-        )
+    df = history_df[history_df["test_name"] == selected_test].copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    fig, ax = plt.subplots()
+    ax.plot(df["timestamp"], df["value"], marker="o")
+    ax.set_title(selected_test)
+    ax.grid(True)
+
+    st.pyplot(fig)
+else:
+    st.info("No history yet")
