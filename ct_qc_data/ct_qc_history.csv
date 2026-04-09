@@ -1,8 +1,1 @@
 timestamp,session_label,site_name,scanner_name,scanner_id,test_name,value,unit,criteria,status,details,source_file,sequence_label
-2026-04-02T14:16:35,IEC Constancy QC,LIMASSOL,SOMATOM,limassol_somatom,Homogeneity,,HU,Worst water HU result within stated tolerance,FAIL,Homogeneity section not found.,IEC constancy.pdf,CT_IEC_CONSTANCY
-2026-04-02T14:16:35,IEC Constancy QC,LIMASSOL,SOMATOM,limassol_somatom,Noise,,HU,Worst slice noise within stated tolerance,FAIL,Noise section not found.,IEC constancy.pdf,CT_IEC_CONSTANCY
-2026-04-02T14:16:35,IEC Constancy QC,LIMASSOL,SOMATOM,limassol_somatom,MTF 50%,,lp/cm,Worst 50% MTF within stated tolerance,FAIL,MTF section not found or could not be parsed.,IEC constancy.pdf,CT_IEC_CONSTANCY
-2026-04-02T14:16:35,IEC Constancy QC,LIMASSOL,SOMATOM,limassol_somatom,MTF 10%,,lp/cm,Worst 10% MTF within stated tolerance,FAIL,MTF section not found or could not be parsed.,IEC constancy.pdf,CT_IEC_CONSTANCY
-2026-04-02T14:16:35,IEC Constancy QC,LIMASSOL,SOMATOM,limassol_somatom,Table Positioning,,mm,All continuous and stepwise positions within stated tolerance,FAIL,Table Positioning section not found.,IEC constancy.pdf,CT_IEC_CONSTANCY
-2026-04-02T14:16:35,IEC Constancy QC,LIMASSOL,SOMATOM,limassol_somatom,Tube Voltage,,kV,All measured kV values within stated tolerance,FAIL,Tube Voltage section not found.,IEC constancy.pdf,CT_IEC_CONSTANCY
-2026-04-02T14:16:35,IEC Constancy QC,LIMASSOL,SOMATOM,limassol_somatom,Image Inspection,,items,All image inspection entries must be Accept,FAIL,Image Inspection section not found.,IEC constancy.pdf,CT_IEC_CONSTANCY
