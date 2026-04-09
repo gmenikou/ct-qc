@@ -554,6 +554,24 @@ def parse_ct_image_inspection(text):
         "status": "PASS" if reject == 0 else "FAIL",
         "details": f"{accept} accepted, {reject} rejected",
     }
+
+def infer_ct_parsers_from_pdf_text(text):
+    results = []
+
+    results.append(parse_ct_homogeneity(text))
+    results.append(parse_ct_noise(text))
+
+    mtf_results = parse_ct_mtf(text)
+    if isinstance(mtf_results, list):
+        results.extend(mtf_results)
+    else:
+        results.append(mtf_results)
+
+    results.append(parse_ct_table_positioning(text))
+    results.append(parse_ct_tube_voltage(text))
+    results.append(parse_ct_image_inspection(text))
+
+    return results
 # =========================================================
 # GITHUB HELPERS
 # =========================================================
