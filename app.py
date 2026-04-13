@@ -55,7 +55,12 @@ CHARTS_DIR.mkdir(exist_ok=True)
 # =========================================================
 TOL_SEP = r"(?:…|\.\.\.|\u2026|\u202f…\u202f|\s+…\s+)"
 
-
+def normalize_pdf_text(text):
+    return (
+        text.replace("\u202f", " ")   # narrow no-break space
+            .replace("\xa0", " ")     # non-breaking space
+            .replace("…", "...")      # unicode ellipsis → "..."
+    )
 def safe_float(text):
     try:
         return float(str(text).replace(",", ".").strip())
@@ -1718,6 +1723,8 @@ uploaded_signature = ""
 if uploaded_file:
     try:
         pdf_text = read_pdf_text(uploaded_file)
+        # 🔧 FIX 1 — normalize weird PDF characters BEFORE parsing
+        pdf_text = normalize_pdf_text(pdf_text)
         pdf_meta = extract_pdf_metadata(pdf_text)
         uploaded_file.seek(0)
         uploaded_signature = str(hash(uploaded_file.getvalue()))
