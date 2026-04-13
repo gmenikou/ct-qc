@@ -1831,12 +1831,12 @@ results_df = pd.DataFrame()
 if uploaded_file:
     with st.spinner("Parsing IEC Constancy PDF..."):
     with st.expander("DEBUG: section checks"):
-    st.write("Homogeneity section found:", bool(extract_section(pdf_text, "1 Homogeneity (IEC Constancy)", "2 Noise (IEC Constancy)")))
-    st.write("Noise section found:", bool(extract_section(pdf_text, "2 Noise (IEC Constancy)", "3 MTF (IEC Constancy)")))
-    st.write("MTF section found:", bool(extract_section(pdf_text, "3 MTF (IEC Constancy)", "4 Table Positioning (IEC Constancy)")))
-    st.write("Table Positioning section found:", bool(extract_section(pdf_text, "4 Table Positioning (IEC Constancy)", "5 Tube Voltage (IEC Constancy)")))
-    st.write("Tube Voltage section found:", bool(extract_section(pdf_text, "5 Tube Voltage (IEC Constancy)", "6 Image Inspection (Constancy)")))
-    st.write("Image Inspection section found:", bool(extract_section(pdf_text, "6 Image Inspection (Constancy)", None)))   
+        st.write("Homogeneity section found:", bool(extract_section(pdf_text, "1 Homogeneity (IEC Constancy)", "2 Noise (IEC Constancy)")))
+        st.write("Noise section found:", bool(extract_section(pdf_text, "2 Noise (IEC Constancy)", "3 MTF (IEC Constancy)")))
+        st.write("MTF section found:", bool(extract_section(pdf_text, "3 MTF (IEC Constancy)", "4 Table Positioning (IEC Constancy)")))
+        st.write("Table Positioning section found:", bool(extract_section(pdf_text, "4 Table Positioning (IEC Constancy)", "5 Tube Voltage (IEC Constancy)")))
+        st.write("Tube Voltage section found:", bool(extract_section(pdf_text, "5 Tube Voltage (IEC Constancy)", "6 Image Inspection (Constancy)")))
+        st.write("Image Inspection section found:", bool(extract_section(pdf_text, "6 Image Inspection (Constancy)", None)))   
         parsed_results = infer_ct_parsers_from_pdf_text(pdf_text)
 
     for r in parsed_results:
