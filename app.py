@@ -278,15 +278,20 @@ def extract_pdf_metadata(text: str):
 
 
 def extract_section(text, start_marker, end_marker=None):
-    start = re.search(re.escape(start_marker), text, re.I)
-    if not start:
+    text = normalize_pdf_text(text)
+
+    start_match = re.search(re.escape(start_marker), text, flags=re.I)
+    if not start_match:
         return ""
 
-    start_idx = start.start()
+    start_idx = start_match.start()
+
     if end_marker:
-        end = re.search(re.escape(end_marker), text[start_idx:], re.I)
-        if end:
-            return text[start_idx:start_idx + end.start()]
+        end_match = re.search(re.escape(end_marker), text[start_idx + len(start_marker):], flags=re.I)
+        if end_match:
+            end_idx = start_idx + len(start_marker) + end_match.start()
+            return text[start_idx:end_idx]
+
     return text[start_idx:]
 
 
@@ -1825,6 +1830,13 @@ results_df = pd.DataFrame()
 
 if uploaded_file:
     with st.spinner("Parsing IEC Constancy PDF..."):
+    with st.expander("DEBUG: section checks"):
+    st.write("Homogeneity section found:", bool(extract_section(pdf_text, "1 Homogeneity (IEC Constancy)", "2 Noise (IEC Constancy)")))
+    st.write("Noise section found:", bool(extract_section(pdf_text, "2 Noise (IEC Constancy)", "3 MTF (IEC Constancy)")))
+    st.write("MTF section found:", bool(extract_section(pdf_text, "3 MTF (IEC Constancy)", "4 Table Positioning (IEC Constancy)")))
+    st.write("Table Positioning section found:", bool(extract_section(pdf_text, "4 Table Positioning (IEC Constancy)", "5 Tube Voltage (IEC Constancy)")))
+    st.write("Tube Voltage section found:", bool(extract_section(pdf_text, "5 Tube Voltage (IEC Constancy)", "6 Image Inspection (Constancy)")))
+    st.write("Image Inspection section found:", bool(extract_section(pdf_text, "6 Image Inspection (Constancy)", None)))   
         parsed_results = infer_ct_parsers_from_pdf_text(pdf_text)
 
     for r in parsed_results:
