@@ -1663,7 +1663,30 @@ if uploaded_file:
         pdf_text = read_pdf_text(uploaded_file)
         pdf_text = normalize_pdf_text(pdf_text)
         pdf_meta = extract_pdf_metadata(pdf_text)
+def debug_dump_sections(pdf_text):
+    sections = {
+        "HOMOGENEITY": SECTION_PATTERNS["homogeneity_start"],
+        "NOISE": SECTION_PATTERNS["noise_start"],
+        "MTF": SECTION_PATTERNS["mtf_start"],
+        "TABLE": SECTION_PATTERNS["table_start"],
+        "TUBE": SECTION_PATTERNS["tube_start"],
+        "IMAGE": SECTION_PATTERNS["image_start"],
+    }
 
+    st.subheader("🔎 Auto Debug: Section Detection")
+
+    for name, pattern in sections.items():
+        matches = list(re.finditer(pattern, pdf_text, flags=re.I | re.M))
+
+        st.write(f"### {name}")
+        st.write(f"Matches found: {len(matches)}")
+
+        for i, m in enumerate(matches):
+            start = max(0, m.start() - 80)
+            end = min(len(pdf_text), m.end() + 200)
+            snippet = pdf_text[start:end]
+
+            st.code(f"[Match {i}] →\n{snippet}")
         with st.expander("DEBUG: extracted PDF text"):
             st.text(pdf_text[:12000])
 
