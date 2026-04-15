@@ -55,7 +55,6 @@ CHARTS_DIR.mkdir(exist_ok=True)
 NUM = r"[-+]?(?:\d+(?:[.,]\d+)?|\.\d+)"
 TOL_SEP = r"(?:…|\.\.\.|\u2026|\u202f…\u202f|\s+…\s+|\s+\.\.\.\s+)"
 
-# Full-line patterns so they do not match the table of contents.
 SECTION_PATTERNS = {
     "homogeneity_start": r"(?m)^1\s+Homogeneity\s*\(IEC\s*Constancy\)\s*$",
     "noise_start": r"(?m)^2\s+Noise\s*\(IEC\s*Constancy\)\s*$",
@@ -64,6 +63,14 @@ SECTION_PATTERNS = {
     "tube_start": r"(?m)^5\s+Tube\s+Voltage\s*\(IEC\s*Constancy\)\s*$",
     "image_start": r"(?m)^6\s+Image\s+Inspection\s*\(Constancy\)\s*$",
 }
+
+MODE_HEADER_PATTERNS = {
+    "homogeneity": r"(?m)^1\.3\.(\d+)\s+(.+)$",
+    "noise": r"(?m)^2\.3\.(\d+)\s+(.+)$",
+    "mtf": r"(?m)^3\.3\.(\d+)\s+(.+)$",
+}
+
+DEBUG_MODE = True
 
 
 def normalize_pdf_text(text):
@@ -101,9 +108,25 @@ def sanitize_filename(text: str) -> str:
 
 
 def normalize_ws(text: str) -> str:
-    return "\n".join(
-        " ".join(line.replace("\u202f", " ").split()) for line in str(text).splitlines()
-    )
+    return "\n".join(" ".join(line.replace("\u202f", " ").split()) for line in str(text).splitlines())
+
+
+def compact_mode_name(name: str) -> str:
+    name = " ".join(str(name).split())
+    name = re.sub(r"\s+\|\s+Serial Number:.*$", "", name, flags=re.I)
+    return name.strip()
+
+
+def format_num(v, digits=3):
+    if v is None or pd.isna(v):
+        return ""
+    try:
+        fv = float(v)
+    except Exception:
+        return str(v)
+    if abs(fv - round(fv)) < 1e-9:
+        return str(int(round(fv)))
+    return f"{fv:.{digits}f}"
 
 
 def get_history_columns():
@@ -181,11 +204,13 @@ def github_is_ready(cfg):
 
 def get_ct_test_order():
     return [
+        "Water Value",
         "Homogeneity",
         "Noise",
         "MTF 50%",
         "MTF 10%",
-        "Table Positioning",
+        "Table Positioning (Continuous)",
+        "Table Positioning (Stepwise)",
         "Tube Voltage",
         "Image Inspection",
     ]
@@ -203,7 +228,7 @@ def sort_tests_ct(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out = df.copy()
     out["_ct_order"] = out["test_name"].apply(ct_sort_key)
-    out = out.sort_values("_ct_order").drop(columns=["_ct_order"])
+    out = out.sort_values(["_ct_order", "sequence_label", "timestamp"], na_position="last").drop(columns=["_ct_order"])
     return out
 
 
@@ -293,12 +318,10 @@ def extract_pdf_metadata(text: str):
 
 def extract_section(text, start_pattern, end_pattern=None):
     text = normalize_pdf_text(text)
-
     starts = list(re.finditer(start_pattern, text, flags=re.I | re.M))
     if not starts:
         return ""
 
-    # Prefer the last match so we skip the table of contents match.
     start_match = starts[-1]
     start_idx = start_match.start()
 
@@ -311,12 +334,6 @@ def extract_section(text, start_pattern, end_pattern=None):
     return text[start_idx:]
 
 
-def value_in_range(value, low, high):
-    if value is None or low is None or high is None:
-        return False
-    return low <= value <= high
-
-
 def iter_clean_lines(section):
     for raw in str(section).splitlines():
         line = " ".join(raw.replace("\u202f", " ").split())
@@ -324,35 +341,78 @@ def iter_clean_lines(section):
             yield line
 
 
+def value_in_range(value, low, high):
+    if value is None or low is None or high is None:
+        return False
+    return low <= value <= high
+
+
+def split_mode_blocks(section_text: str, header_pattern: str, name_group: int = 2):
+    section_text = normalize_pdf_text(section_text)
+    matches = list(re.finditer(header_pattern, section_text, flags=re.M))
+    if not matches:
+        return []
+
+    blocks = []
+    for i, m in enumerate(matches):
+        name = compact_mode_name(m.group(name_group))
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(section_text)
+        block_text = section_text[start:end]
+        blocks.append((name, block_text))
+    return blocks
+
+
 def parse_tolerance_line(line):
     line = normalize_pdf_text(line)
-
     m = re.search(rf"Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})", line, re.I)
     if m:
         return safe_float(m.group(1)), safe_float(m.group(2))
 
-    nums = re.findall(NUM, line)
+    nums = [safe_float(x) for x in re.findall(NUM, line)]
     if ("Tolerance" in line or "Reference Tolerance" in line) and len(nums) >= 2 and "..." in line:
-        return safe_float(nums[-2]), safe_float(nums[-1])
+        return nums[-2], nums[-1]
 
     return None, None
 
 
-def find_summary_statuses(text):
-    section = extract_section(text, r"(?m)^Summary\s*$", r"IEC\s+Constancy\s+Standard")
-    statuses = {}
-    for line in iter_clean_lines(section):
-        m = re.search(
-            r"^(Homogeneity\s*\(IEC Constancy\)|Noise\s*\(IEC Constancy\)|MTF\s*\(IEC Constancy\)|Table Positioning\s*\(IEC Constancy\)|Tube Voltage\s*\(IEC Constancy\)|Image Inspection\s*\(Constancy\))\s+.*\s+(OK|NOT OK)$",
-            line,
-            re.I,
-        )
-        if m:
-            statuses[m.group(1).strip()] = m.group(2).upper().replace("NOT ", "FAIL_")
-    return statuses
+def row_status(value, low, high):
+    return "PASS" if value_in_range(value, low, high) else "FAIL"
+
+
+def summarize_slice_rows(rows, metric_name, worst_by="max_abs"):
+    if not rows:
+        return None
+
+    if worst_by == "max_abs":
+        worst = max(rows, key=lambda x: abs(x["value"]))
+    elif worst_by == "max":
+        worst = max(rows, key=lambda x: x["value"])
+    elif worst_by == "min":
+        worst = min(rows, key=lambda x: x["value"])
+    else:
+        worst = rows[0]
+
+    overall_status = "PASS" if all(r["status"] == "PASS" for r in rows) else "FAIL"
+    return worst, overall_status
+
+
+def make_result(test_name, sequence_label, value, unit, criteria, status, details):
+    return {
+        "test_name": test_name,
+        "value": value,
+        "unit": unit,
+        "criteria": criteria,
+        "status": status,
+        "details": details,
+        "sequence_label": sequence_label,
+    }
 
 
 def debug_dump_sections(pdf_text):
+    if not DEBUG_MODE:
+        return
+
     sections = {
         "HOMOGENEITY": SECTION_PATTERNS["homogeneity_start"],
         "NOISE": SECTION_PATTERNS["noise_start"],
@@ -375,64 +435,164 @@ def debug_dump_sections(pdf_text):
 
 
 # =========================================================
-# CT PARSERS FOR SIEMENS IEC CONSTANCY LAYOUT
+# CT PARSERS
 # =========================================================
-def parse_ct_homogeneity(text):
+def parse_ct_water_value_and_homogeneity(text):
     section = extract_section(
         text,
         SECTION_PATTERNS["homogeneity_start"],
         SECTION_PATTERNS["noise_start"],
     )
+    mode_blocks = split_mode_blocks(section, MODE_HEADER_PATTERNS["homogeneity"])
 
-    values = []
-    current_low, current_high = None, None
+    results = []
+    for mode_name, block in mode_blocks:
+        lines = list(iter_clean_lines(block))
 
-    for line in iter_clean_lines(section):
-        low, high = parse_tolerance_line(line)
-        if low is not None and high is not None:
-            current_low, current_high = low, high
-            continue
+        # -------- Water Value --------
+        water_rows = []
+        current_low, current_high = None, None
+        in_water = False
 
-        m_inline = re.search(
-            rf"^(Diff\.\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})$",
-            line,
-            re.I,
-        )
-        if m_inline:
-            label = m_inline.group(1)
-            val = safe_float(m_inline.group(2))
-            low = safe_float(m_inline.group(4))
-            high = safe_float(m_inline.group(5))
-            values.append((label, val, low, high))
-            continue
+        for line in lines:
+            if "Water Value Results" in line:
+                in_water = True
+                continue
 
-        m_simple = re.search(rf"^(Diff\.\d+)\s+({NUM})\s+({NUM})$", line, re.I)
-        if m_simple and current_low is not None and current_high is not None:
-            label = m_simple.group(1)
-            val = safe_float(m_simple.group(2))
-            values.append((label, val, current_low, current_high))
+            if re.match(r"^Slice\s+\d+$", line, re.I):
+                in_water = False
 
-    if not values:
-        return {
-            "test_name": "Homogeneity",
-            "value": None,
-            "unit": "HU",
-            "criteria": "Worst absolute peripheral difference",
-            "status": "FAIL",
-            "details": "Parsing failed",
-        }
+            low, high = parse_tolerance_line(line)
+            if low is not None and high is not None:
+                current_low, current_high = low, high
+                continue
 
-    worst = max(values, key=lambda x: abs(x[1]))
-    failed = [v for v in values if not value_in_range(v[1], v[2], v[3])]
+            if not in_water:
+                continue
 
-    return {
-        "test_name": "Homogeneity",
-        "value": worst[1],
-        "unit": "HU",
-        "criteria": "Worst absolute peripheral difference",
-        "status": "PASS" if not failed else "FAIL",
-        "details": f"Worst {worst[0]} = {worst[1]} [{worst[2]},{worst[3]}] across {len(values)} values",
-    }
+            m_inline = re.search(
+                rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})$",
+                line,
+                re.I,
+            )
+            if m_inline:
+                water_rows.append(
+                    {
+                        "slice": int(m_inline.group(1)),
+                        "value": safe_float(m_inline.group(2)),
+                        "reference": safe_float(m_inline.group(3)),
+                        "low": safe_float(m_inline.group(4)),
+                        "high": safe_float(m_inline.group(5)),
+                    }
+                )
+                water_rows[-1]["status"] = row_status(water_rows[-1]["value"], water_rows[-1]["low"], water_rows[-1]["high"])
+                continue
+
+            m_simple = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})$", line, re.I)
+            if m_simple and current_low is not None and current_high is not None:
+                water_rows.append(
+                    {
+                        "slice": int(m_simple.group(1)),
+                        "value": safe_float(m_simple.group(2)),
+                        "reference": safe_float(m_simple.group(3)),
+                        "low": current_low,
+                        "high": current_high,
+                    }
+                )
+                water_rows[-1]["status"] = row_status(water_rows[-1]["value"], water_rows[-1]["low"], water_rows[-1]["high"])
+
+        if water_rows:
+            worst, overall_status = summarize_slice_rows(water_rows, "Water Value", worst_by="max_abs")
+            slice_summary = "; ".join(
+                f"S{r['slice']}={format_num(r['value'])} HU [{format_num(r['low'],2)},{format_num(r['high'],2)}] {r['status']}"
+                for r in water_rows
+            )
+            results.append(
+                make_result(
+                    "Water Value",
+                    mode_name,
+                    abs(worst["value"]),
+                    "HU",
+                    "Worst absolute central ROI CT number within tolerance",
+                    overall_status,
+                    f"Worst slice {worst['slice']} water value = {format_num(worst['value'])} HU; "
+                    f"reference {format_num(worst['reference'])} HU; "
+                    f"tolerance [{format_num(worst['low'],2)},{format_num(worst['high'],2)}]. "
+                    f"All slices: {slice_summary}",
+                )
+            )
+
+        # -------- Homogeneity --------
+        diff_rows = []
+        current_slice = None
+        current_low, current_high = None, None
+
+        for line in lines:
+            m_slice = re.match(r"^Slice\s+(\d+)$", line, re.I)
+            if m_slice:
+                current_slice = int(m_slice.group(1))
+                continue
+
+            low, high = parse_tolerance_line(line)
+            if low is not None and high is not None:
+                # Homogeneity acceptance is fixed ±4 HU, even if water value rows in same section use ±6.
+                current_low, current_high = low, high
+                continue
+
+            m_inline = re.search(
+                rf"^(Diff\.\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})$",
+                line,
+                re.I,
+            )
+            if m_inline:
+                row = {
+                    "slice": current_slice,
+                    "position": m_inline.group(1),
+                    "value": safe_float(m_inline.group(2)),
+                    "reference": safe_float(m_inline.group(3)),
+                    "low": safe_float(m_inline.group(4)),
+                    "high": safe_float(m_inline.group(5)),
+                }
+                row["status"] = row_status(row["value"], row["low"], row["high"])
+                diff_rows.append(row)
+                continue
+
+            m_simple = re.search(rf"^(Diff\.\d+)\s+({NUM})\s+({NUM})$", line, re.I)
+            if m_simple and current_slice is not None:
+                low = current_low if current_low is not None else -4.0
+                high = current_high if current_high is not None else 4.0
+                row = {
+                    "slice": current_slice,
+                    "position": m_simple.group(1),
+                    "value": safe_float(m_simple.group(2)),
+                    "reference": safe_float(m_simple.group(3)),
+                    "low": low,
+                    "high": high,
+                }
+                row["status"] = row_status(row["value"], row["low"], row["high"])
+                diff_rows.append(row)
+
+        if diff_rows:
+            worst, overall_status = summarize_slice_rows(diff_rows, "Homogeneity", worst_by="max_abs")
+            slice_summary = "; ".join(
+                f"S{r['slice']} {r['position']}={format_num(r['value'])} HU [{format_num(r['low'],2)},{format_num(r['high'],2)}] {r['status']}"
+                for r in diff_rows
+            )
+            results.append(
+                make_result(
+                    "Homogeneity",
+                    mode_name,
+                    abs(worst["value"]),
+                    "HU",
+                    "Max peripheral-centre difference within ±4 HU",
+                    overall_status,
+                    f"Worst slice {worst['slice']} {worst['position']} = {format_num(worst['value'])} HU; "
+                    f"tolerance [{format_num(worst['low'],2)},{format_num(worst['high'],2)}]. "
+                    f"All differences: {slice_summary}",
+                )
+            )
+
+    return results
 
 
 def parse_ct_noise(text):
@@ -441,49 +601,54 @@ def parse_ct_noise(text):
         SECTION_PATTERNS["noise_start"],
         SECTION_PATTERNS["mtf_start"],
     )
+    mode_blocks = split_mode_blocks(section, MODE_HEADER_PATTERNS["noise"])
 
-    values = []
-    failed = []
+    results = []
+    for mode_name, block in mode_blocks:
+        rows = []
+        for line in iter_clean_lines(block):
+            m = re.search(
+                rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})(?:\s+(In Tol\.|Out Tol\.))?$",
+                line,
+                re.I,
+            )
+            if not m:
+                continue
 
-    for line in iter_clean_lines(section):
-        m = re.search(
-            rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})(?:\s+(In Tol\.|Out Tol\.))?$",
-            line,
-            re.I,
-        )
-        if not m:
+            row = {
+                "slice": int(m.group(1)),
+                "value": safe_float(m.group(2)),
+                "reference": safe_float(m.group(3)),
+                "low": safe_float(m.group(4)),
+                "high": safe_float(m.group(5)),
+            }
+            row["status"] = row_status(row["value"], row["low"], row["high"])
+            rows.append(row)
+
+        if not rows:
             continue
 
-        slice_no = int(m.group(1))
-        val = safe_float(m.group(2))
-        ref = safe_float(m.group(3))
-        low = safe_float(m.group(4))
-        high = safe_float(m.group(5))
-        row_status = m.group(6) or ""
+        worst, overall_status = summarize_slice_rows(rows, "Noise", worst_by="max")
+        slice_summary = "; ".join(
+            f"S{r['slice']}={format_num(r['value'])} HU [{format_num(r['low'],2)},{format_num(r['high'],2)}] {r['status']}"
+            for r in rows
+        )
+        results.append(
+            make_result(
+                "Noise",
+                mode_name,
+                worst["value"],
+                "HU",
+                "Each slice must be within its slice-specific tolerance",
+                overall_status,
+                f"Worst slice {worst['slice']} noise = {format_num(worst['value'])} HU; "
+                f"reference {format_num(worst['reference'])} HU; "
+                f"tolerance [{format_num(worst['low'],2)},{format_num(worst['high'],2)}]. "
+                f"All slices: {slice_summary}",
+            )
+        )
 
-        values.append((slice_no, val, ref, low, high))
-        if ("Out" in row_status) or (not value_in_range(val, low, high)):
-            failed.append((slice_no, val))
-
-    if not values:
-        return {
-            "test_name": "Noise",
-            "value": None,
-            "unit": "HU",
-            "criteria": "Worst noise",
-            "status": "FAIL",
-            "details": "Parsing failed",
-        }
-
-    worst = max(values, key=lambda x: x[1])
-    return {
-        "test_name": "Noise",
-        "value": worst[1],
-        "unit": "HU",
-        "criteria": "Worst noise",
-        "status": "PASS" if not failed else "FAIL",
-        "details": f"Worst slice {worst[0]} noise = {worst[1]} [{worst[3]},{worst[4]}]",
-    }
+    return results
 
 
 def parse_ct_mtf(text):
@@ -492,98 +657,132 @@ def parse_ct_mtf(text):
         SECTION_PATTERNS["mtf_start"],
         SECTION_PATTERNS["table_start"],
     )
+    mode_blocks = split_mode_blocks(section, MODE_HEADER_PATTERNS["mtf"])
 
-    vals50 = []
-    vals10 = []
-    tol50 = (None, None)
-    tol10 = (None, None)
+    results = []
+    for mode_name, block in mode_blocks:
+        tol50 = (None, None)
+        tol10 = (None, None)
+        rows50 = []
+        rows10 = []
 
-    for line in iter_clean_lines(section):
-        m_tol = re.search(
-            rf"Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})\s+Reference\s+Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})",
-            line,
-            re.I,
-        )
-        if m_tol:
-            tol50 = (safe_float(m_tol.group(1)), safe_float(m_tol.group(2)))
-            tol10 = (safe_float(m_tol.group(3)), safe_float(m_tol.group(4)))
-            continue
-
-        if ("Tolerance" in line and "Reference Tolerance" in line) or (
-            "Tolerance" in line and "Reference" in line and "..." in line
-        ):
-            nums = [safe_float(x) for x in re.findall(NUM, line)]
-            if len(nums) >= 4:
-                tol50 = (nums[0], nums[1])
-                tol10 = (nums[2], nums[3])
+        for line in iter_clean_lines(block):
+            m_tol = re.search(
+                rf"Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})\s+Reference\s+Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})",
+                line,
+                re.I,
+            )
+            if m_tol:
+                tol50 = (safe_float(m_tol.group(1)), safe_float(m_tol.group(2)))
+                tol10 = (safe_float(m_tol.group(3)), safe_float(m_tol.group(4)))
                 continue
 
-        m_row = re.search(
-            rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})$",
-            line,
-            re.I,
-        )
-        if m_row:
-            slice_no = int(m_row.group(1))
-            val50 = safe_float(m_row.group(2))
-            ref50 = safe_float(m_row.group(3))
-            val10 = safe_float(m_row.group(4))
-            ref10 = safe_float(m_row.group(5))
-            vals50.append((slice_no, val50, ref50, tol50[0], tol50[1]))
-            vals10.append((slice_no, val10, ref10, tol10[0], tol10[1]))
-            continue
+            if ("Tolerance" in line and "Reference Tolerance" in line) or ("Tolerance" in line and "Reference" in line and "..." in line):
+                nums = [safe_float(x) for x in re.findall(NUM, line)]
+                if len(nums) >= 4:
+                    tol50 = (nums[0], nums[1])
+                    tol10 = (nums[2], nums[3])
+                    continue
 
-        m_sharp_row = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})$", line, re.I)
-        if m_sharp_row and tol50[0] is not None and tol10[0] is not None:
-            slice_no = int(m_sharp_row.group(1))
-            val50 = safe_float(m_sharp_row.group(2))
-            val10 = safe_float(m_sharp_row.group(3))
-            vals50.append((slice_no, val50, None, tol50[0], tol50[1]))
-            vals10.append((slice_no, val10, None, tol10[0], tol10[1]))
+            m_row = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})$", line, re.I)
+            if m_row:
+                slice_no = int(m_row.group(1))
+                val50 = safe_float(m_row.group(2))
+                ref50 = safe_float(m_row.group(3))
+                val10 = safe_float(m_row.group(4))
+                ref10 = safe_float(m_row.group(5))
 
-    if not vals50 or not vals10:
-        return [
-            {
-                "test_name": "MTF 50%",
-                "value": None,
-                "unit": "lp/cm",
-                "criteria": "Lowest",
-                "status": "FAIL",
-                "details": "Parsing failed",
-            },
-            {
-                "test_name": "MTF 10%",
-                "value": None,
-                "unit": "lp/cm",
-                "criteria": "Lowest",
-                "status": "FAIL",
-                "details": "Parsing failed",
-            },
-        ]
+                row50 = {
+                    "slice": slice_no,
+                    "value": val50,
+                    "reference": ref50,
+                    "low": tol50[0],
+                    "high": tol50[1],
+                }
+                row50["status"] = row_status(row50["value"], row50["low"], row50["high"])
+                rows50.append(row50)
 
-    fail50 = [v for v in vals50 if not value_in_range(v[1], v[3], v[4])]
-    fail10 = [v for v in vals10 if not value_in_range(v[1], v[3], v[4])]
-    worst50 = min(vals50, key=lambda x: x[1])
-    worst10 = min(vals10, key=lambda x: x[1])
+                row10 = {
+                    "slice": slice_no,
+                    "value": val10,
+                    "reference": ref10,
+                    "low": tol10[0],
+                    "high": tol10[1],
+                }
+                row10["status"] = row_status(row10["value"], row10["low"], row10["high"])
+                rows10.append(row10)
+                continue
 
-    return [
-        {
-            "test_name": "MTF 50%",
-            "value": worst50[1],
-            "unit": "lp/cm",
-            "criteria": "Lowest measured value",
-            "status": "PASS" if not fail50 else "FAIL",
-            "details": f"Lowest slice {worst50[0]} = {worst50[1]} [{worst50[3]},{worst50[4]}]",
-        },
-        {
-            "test_name": "MTF 10%",
-            "value": worst10[1],
-            "unit": "lp/cm",
-            "criteria": "Lowest measured value",
-            "status": "PASS" if not fail10 else "FAIL",
-            "details": f"Lowest slice {worst10[0]} = {worst10[1]} [{worst10[3]},{worst10[4]}]",
-        },
-    ]
+            # Sharpest mode fallback: slice value50 value10
+            m_sharp = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})$", line, re.I)
+            if m_sharp and tol50[0] is not None and tol10[0] is not None:
+                slice_no = int(m_sharp.group(1))
+                val50 = safe_float(m_sharp.group(2))
+                val10 = safe_float(m_sharp.group(3))
+
+                row50 = {
+                    "slice": slice_no,
+                    "value": val50,
+                    "reference": None,
+                    "low": tol50[0],
+                    "high": tol50[1],
+                }
+                row50["status"] = row_status(row50["value"], row50["low"], row50["high"])
+                rows50.append(row50)
+
+                row10 = {
+                    "slice": slice_no,
+                    "value": val10,
+                    "reference": None,
+                    "low": tol10[0],
+                    "high": tol10[1],
+                }
+                row10["status"] = row_status(row10["value"], row10["low"], row10["high"])
+                rows10.append(row10)
+
+        if rows50:
+            worst50, status50 = summarize_slice_rows(rows50, "MTF 50%", worst_by="min")
+            slice_summary50 = "; ".join(
+                f"S{r['slice']}={format_num(r['value'])} ref={format_num(r['reference'])} [{format_num(r['low'],2)},{format_num(r['high'],2)}] {r['status']}"
+                for r in rows50
+            )
+            results.append(
+                make_result(
+                    "MTF 50%",
+                    mode_name,
+                    worst50["value"],
+                    "lp/cm",
+                    "All slices within mode-specific MTF 50% tolerance",
+                    status50,
+                    f"Worst slice {worst50['slice']} MTF 50% = {format_num(worst50['value'])} lp/cm; "
+                    f"reference {format_num(worst50['reference'])} lp/cm; "
+                    f"tolerance [{format_num(worst50['low'],2)},{format_num(worst50['high'],2)}]. "
+                    f"All slices: {slice_summary50}",
+                )
+            )
+
+        if rows10:
+            worst10, status10 = summarize_slice_rows(rows10, "MTF 10%", worst_by="min")
+            slice_summary10 = "; ".join(
+                f"S{r['slice']}={format_num(r['value'])} ref={format_num(r['reference'])} [{format_num(r['low'],2)},{format_num(r['high'],2)}] {r['status']}"
+                for r in rows10
+            )
+            results.append(
+                make_result(
+                    "MTF 10%",
+                    mode_name,
+                    worst10["value"],
+                    "lp/cm",
+                    "All slices within mode-specific MTF 10% tolerance",
+                    status10,
+                    f"Worst slice {worst10['slice']} MTF 10% = {format_num(worst10['value'])} lp/cm; "
+                    f"reference {format_num(worst10['reference'])} lp/cm; "
+                    f"tolerance [{format_num(worst10['low'],2)},{format_num(worst10['high'],2)}]. "
+                    f"All slices: {slice_summary10}",
+                )
+            )
+
+    return results
 
 
 def parse_ct_table_positioning(text):
@@ -593,8 +792,8 @@ def parse_ct_table_positioning(text):
         SECTION_PATTERNS["tube_start"],
     )
 
-    deviations = []
-    failed = []
+    cont_rows = []
+    step_rows = []
 
     for line in iter_clean_lines(section):
         m = re.search(
@@ -613,32 +812,56 @@ def parse_ct_table_positioning(text):
         step_low = safe_float(m.group(6))
         step_high = safe_float(m.group(7))
 
-        deviations.append(abs(cont))
-        deviations.append(abs(step))
+        rowc = {"position": pos, "value": cont, "low": cont_low, "high": cont_high}
+        rowc["status"] = row_status(rowc["value"], rowc["low"], rowc["high"])
+        cont_rows.append(rowc)
 
-        if not value_in_range(cont, cont_low, cont_high):
-            failed.append((pos, "continuous", cont))
-        if not value_in_range(step, step_low, step_high):
-            failed.append((pos, "stepwise", step))
+        rows = {"position": pos, "value": step, "low": step_low, "high": step_high}
+        rows["status"] = row_status(rows["value"], rows["low"], rows["high"])
+        step_rows.append(rows)
 
-    if not deviations:
-        return {
-            "test_name": "Table Positioning",
-            "value": None,
-            "unit": "mm",
-            "criteria": "Within tolerance",
-            "status": "FAIL",
-            "details": "Parsing failed",
-        }
+    results = []
+    if cont_rows:
+        worst = max(cont_rows, key=lambda x: abs(x["value"]))
+        status = "PASS" if abs(worst["value"]) <= 1.0 and all(r["status"] == "PASS" for r in cont_rows) else "FAIL"
+        pos_summary = "; ".join(
+            f"P{r['position']}={format_num(r['value'])} mm [{format_num(r['low'],2)},{format_num(r['high'],2)}] {r['status']}"
+            for r in cont_rows
+        )
+        results.append(
+            make_result(
+                "Table Positioning (Continuous)",
+                "Continuous movement",
+                abs(worst["value"]),
+                "mm",
+                "Worst result within ±1 mm of expected position",
+                status,
+                f"Worst continuous result at position {worst['position']} = {format_num(worst['value'])} mm. "
+                f"All positions: {pos_summary}",
+            )
+        )
 
-    return {
-        "test_name": "Table Positioning",
-        "value": max(deviations),
-        "unit": "mm",
-        "criteria": "All positions within tolerance",
-        "status": "PASS" if not failed else "FAIL",
-        "details": f"Max absolute indicated position = {max(deviations)}",
-    }
+    if step_rows:
+        worst = max(step_rows, key=lambda x: abs(x["value"]))
+        status = "PASS" if abs(worst["value"]) <= 1.0 and all(r["status"] == "PASS" for r in step_rows) else "FAIL"
+        pos_summary = "; ".join(
+            f"P{r['position']}={format_num(r['value'])} mm [{format_num(r['low'],2)},{format_num(r['high'],2)}] {r['status']}"
+            for r in step_rows
+        )
+        results.append(
+            make_result(
+                "Table Positioning (Stepwise)",
+                "Stepwise movement",
+                abs(worst["value"]),
+                "mm",
+                "Worst result within ±1 mm of expected position",
+                status,
+                f"Worst stepwise result at position {worst['position']} = {format_num(worst['value'])} mm. "
+                f"All positions: {pos_summary}",
+            )
+        )
+
+    return results
 
 
 def parse_ct_tube_voltage(text):
@@ -648,9 +871,7 @@ def parse_ct_tube_voltage(text):
         SECTION_PATTERNS["image_start"],
     )
 
-    deviations = []
-    failed = []
-
+    rows = []
     for line in iter_clean_lines(section):
         m = re.search(
             rf"^(\d+)\s+(\d+)\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})(?:\s+(In Tol\.|Out Tol\.))?$",
@@ -665,30 +886,39 @@ def parse_ct_tube_voltage(text):
         measured = safe_float(m.group(3))
         low = safe_float(m.group(4))
         high = safe_float(m.group(5))
-        row_status = m.group(6) or ""
 
-        deviations.append(abs(measured - nominal))
-        if ("Out" in row_status) or (not value_in_range(measured, low, high)):
-            failed.append((nominal, measured, current))
-
-    if not deviations:
-        return {
-            "test_name": "Tube Voltage",
-            "value": None,
-            "unit": "kV",
-            "criteria": "All measured kV within tolerance",
-            "status": "FAIL",
-            "details": "Parsing failed",
+        row = {
+            "nominal": nominal,
+            "current": current,
+            "measured": measured,
+            "low": low,
+            "high": high,
+            "deviation": abs(measured - nominal),
         }
+        row["status"] = row_status(row["measured"], row["low"], row["high"])
+        rows.append(row)
 
-    return {
-        "test_name": "Tube Voltage",
-        "value": max(deviations),
-        "unit": "kV",
-        "criteria": "Max absolute deviation from nominal",
-        "status": "PASS" if not failed else "FAIL",
-        "details": f"Max deviation {max(deviations):.3f} kV",
-    }
+    if not rows:
+        return []
+
+    worst = max(rows, key=lambda x: x["deviation"])
+    overall_status = "PASS" if all(r["status"] == "PASS" for r in rows) else "FAIL"
+    row_summary = "; ".join(
+        f"{int(r['nominal'])} kV -> {format_num(r['measured'])} kV [{format_num(r['low'],2)},{format_num(r['high'],2)}] {r['status']}"
+        for r in rows
+    )
+    return [
+        make_result(
+            "Tube Voltage",
+            "Minimum / middle / maximum tube voltages",
+            worst["deviation"],
+            "kV",
+            "All measured kV within tolerance",
+            overall_status,
+            f"Worst deviation at nominal {int(worst['nominal'])} kV: measured {format_num(worst['measured'])} kV "
+            f"(Δ={format_num(worst['deviation'])} kV). All rows: {row_summary}",
+        )
+    ]
 
 
 def parse_ct_image_inspection(text):
@@ -696,30 +926,28 @@ def parse_ct_image_inspection(text):
     accept = len(re.findall(r"\bAccept\b", section, flags=re.I))
     reject = len(re.findall(r"\bReject\b|\bFail\b", section, flags=re.I))
 
-    return {
-        "test_name": "Image Inspection",
-        "value": accept,
-        "unit": "items",
-        "criteria": "All Accept",
-        "status": "PASS" if reject == 0 and accept > 0 else "FAIL",
-        "details": f"{accept} accepted, {reject} rejected",
-    }
+    status = "PASS" if reject == 0 and accept > 0 else "FAIL"
+    return [
+        make_result(
+            "Image Inspection",
+            "Qualitative visual inspection",
+            accept,
+            "images",
+            "All images must be accepted by the user",
+            status,
+            f"{accept} accepted, {reject} rejected. Qualitative test with no numeric tolerances.",
+        )
+    ]
 
 
 def infer_ct_parsers_from_pdf_text(text):
     results = []
-    results.append(parse_ct_homogeneity(text))
-    results.append(parse_ct_noise(text))
-
-    mtf_results = parse_ct_mtf(text)
-    if isinstance(mtf_results, list):
-        results.extend(mtf_results)
-    else:
-        results.append(mtf_results)
-
-    results.append(parse_ct_table_positioning(text))
-    results.append(parse_ct_tube_voltage(text))
-    results.append(parse_ct_image_inspection(text))
+    results.extend(parse_ct_water_value_and_homogeneity(text))
+    results.extend(parse_ct_noise(text))
+    results.extend(parse_ct_mtf(text))
+    results.extend(parse_ct_table_positioning(text))
+    results.extend(parse_ct_tube_voltage(text))
+    results.extend(parse_ct_image_inspection(text))
     return results
 
 
@@ -736,9 +964,7 @@ def github_headers(token):
 def github_get_file(owner, repo, path, token, branch="main"):
     try:
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        resp = requests.get(
-            url, headers=github_headers(token), params={"ref": branch}, timeout=30
-        )
+        resp = requests.get(url, headers=github_headers(token), params={"ref": branch}, timeout=30)
     except requests.RequestException as e:
         return None, None, f"GitHub connection error: {e}"
 
@@ -764,9 +990,7 @@ def github_put_file(owner, repo, path, token, content_text, message, branch="mai
         if sha:
             payload["sha"] = sha
 
-        resp = requests.put(
-            url, headers=github_headers(token), json=payload, timeout=30
-        )
+        resp = requests.put(url, headers=github_headers(token), json=payload, timeout=30)
     except requests.RequestException as e:
         return False, f"GitHub connection error: {e}"
 
@@ -784,9 +1008,7 @@ def github_delete_file(owner, repo, path, token, message, branch="main", sha=Non
             "branch": branch,
             "sha": sha,
         }
-        resp = requests.delete(
-            url, headers=github_headers(token), json=payload, timeout=30
-        )
+        resp = requests.delete(url, headers=github_headers(token), json=payload, timeout=30)
     except requests.RequestException as e:
         return False, f"GitHub connection error: {e}"
 
@@ -1150,7 +1372,11 @@ def build_frontpage_trend_df(history_df, include_current_df=None):
     trend_df["timestamp_dt"] = pd.to_datetime(trend_df["timestamp"], errors="coerce")
     trend_df = trend_df.dropna(subset=["timestamp_dt"])
 
-    out = trend_df.sort_values(["scanner_id", "test_name", "timestamp_dt"]).reset_index(drop=True)
+    out = trend_df.sort_values(["scanner_id", "test_name", "sequence_label", "timestamp_dt"]).reset_index(drop=True)
+    out["trend_label"] = out.apply(
+        lambda r: f"{r['test_name']} | {r['sequence_label']}" if str(r["sequence_label"]).strip() else r["test_name"],
+        axis=1,
+    )
     return out
 
 
@@ -1294,17 +1520,18 @@ def status_paragraph(status, styles):
 def format_value_unit(value, unit):
     if pd.isna(value):
         return ""
-    try:
-        if float(value).is_integer():
-            value = int(value)
-    except Exception:
-        pass
-    return f"{value} {unit}".strip()
+    return f"{format_num(value)} {unit}".strip()
 
 
 def format_session_date(ts):
     ts = str(ts)
     return ts.split("T")[0] if ts else ""
+
+
+def display_test_label(row):
+    seq = str(row.get("sequence_label", "")).strip()
+    test = str(row.get("test_name", "")).strip()
+    return f"{test} | {seq}" if seq else test
 
 
 def build_results_table(results_df, styles):
@@ -1315,7 +1542,7 @@ def build_results_table(results_df, styles):
     header_style = styles["TableHeaderCustom"]
 
     table_data = [[
-        Paragraph("Test", header_style),
+        Paragraph("Test / Mode", header_style),
         Paragraph("Value", header_style),
         Paragraph("Tolerance / Criteria", header_style),
         Paragraph("Status", header_style),
@@ -1324,7 +1551,7 @@ def build_results_table(results_df, styles):
     for _, row in df.iterrows():
         value_text = format_value_unit(row["value"], row["unit"])
         criteria_text = str(row["criteria"]) if pd.notna(row["criteria"]) else ""
-        test_text = str(row["test_name"]) if pd.notna(row["test_name"]) else ""
+        test_text = display_test_label(row)
 
         table_data.append([
             Paragraph(test_text, cell_style),
@@ -1335,7 +1562,7 @@ def build_results_table(results_df, styles):
 
     table = Table(
         table_data,
-        colWidths=[170, 80, 210, 50],
+        colWidths=[220, 80, 160, 50],
         repeatRows=1,
         splitByRow=1,
     )
@@ -1373,40 +1600,35 @@ def fig_to_rl_image(fig, width=500):
     return RLImage(buf, width=width, height=width * aspect)
 
 
-def add_reference_lines_ct(ax, selected_test):
-    if selected_test == "Homogeneity":
+def add_reference_lines_ct(ax, trend_label):
+    if trend_label.startswith("Water Value"):
+        ax.axhline(6.0, linestyle="--", alpha=0.7)
+        ax.axhline(-6.0, linestyle="--", alpha=0.7)
+    elif trend_label.startswith("Homogeneity"):
         ax.axhline(4.0, linestyle="--", alpha=0.7)
         ax.axhline(-4.0, linestyle="--", alpha=0.7)
-    elif selected_test == "MTF 50%":
-        ax.axhline(3.13, linestyle="--", alpha=0.7)
-        ax.axhline(3.83, linestyle="--", alpha=0.7)
-    elif selected_test == "MTF 10%":
-        ax.axhline(5.71, linestyle="--", alpha=0.7)
-        ax.axhline(6.97, linestyle="--", alpha=0.7)
-    elif selected_test == "Table Positioning":
+    elif trend_label.startswith("Table Positioning"):
         ax.axhline(1.0, linestyle="--", alpha=0.7)
-    elif selected_test == "Tube Voltage":
-        ax.axhline(0.0, linestyle="--", alpha=0.4)
 
 
-def create_trend_chart(df, test_name):
+def create_trend_chart(df, trend_label):
     sub = build_frontpage_trend_df(df)
     if sub.empty:
         return None
 
-    sub = sub[sub["test_name"] == test_name].copy()
+    sub = sub[sub["trend_label"] == trend_label].copy()
     sub = sub.dropna(subset=["timestamp_dt", "value"]).sort_values("timestamp_dt")
     if sub.empty:
         return None
 
     fig, ax = plt.subplots(figsize=(8, 4.2))
     ax.plot(sub["timestamp_dt"], sub["value"], marker="o")
-    ax.set_title(test_name)
+    ax.set_title(trend_label)
     unit = sub["unit"].dropna().iloc[0] if not sub["unit"].dropna().empty else ""
     ax.set_xlabel("Timestamp")
     ax.set_ylabel(f"Value ({unit})")
     ax.grid(True, alpha=0.3)
-    add_reference_lines_ct(ax, test_name)
+    add_reference_lines_ct(ax, trend_label)
     fig.autofmt_xdate()
     return fig
 
@@ -1469,11 +1691,7 @@ def build_pdf_report(
 
     elements.append(Paragraph("Parsed Details", styles["SectionHeadingCustom"]))
     for _, row in results_df.iterrows():
-        label_bits = [
-            x for x in [row["test_name"], row.get("source_file", ""), row.get("sequence_label", "")]
-            if str(x).strip()
-        ]
-        label = " | ".join(label_bits)
+        label = display_test_label(row)
         elements.append(Paragraph(f"<b>{label}:</b> {row['details']}", styles["MetaCustom"]))
         elements.append(Spacer(1, 4))
 
@@ -1481,12 +1699,19 @@ def build_pdf_report(
     elements.append(Paragraph("Trend Charts", styles["SectionHeadingCustom"]))
     added_any_chart = False
 
-    for test_name in results_df["test_name"].tolist():
-        fig = create_trend_chart(history_df, test_name)
+    trend_labels = []
+    for _, row in results_df.iterrows():
+        lbl = display_test_label(row)
+        if lbl not in trend_labels:
+            trend_labels.append(lbl)
+
+    hist = build_frontpage_trend_df(history_df)
+    for trend_label in trend_labels:
+        fig = create_trend_chart(hist, trend_label)
         if fig is not None:
             added_any_chart = True
             elements.append(Spacer(1, 6))
-            elements.append(Paragraph(test_name, styles["MetaCustom"]))
+            elements.append(Paragraph(trend_label, styles["MetaCustom"]))
             elements.append(fig_to_rl_image(fig, width=500))
             plt.close(fig)
             elements.append(Spacer(1, 8))
@@ -1547,12 +1772,7 @@ def build_session_summary_pdf(history_df, site_name=None, scanner_name=None, sca
             scanner_name=scanner_name or "",
             include_logo=True,
         )
-        elements.append(
-            Paragraph(
-                "No matching session history found for the selected scanner.",
-                styles["MetaCustom"],
-            )
-        )
+        elements.append(Paragraph("No matching session history found for the selected scanner.", styles["MetaCustom"]))
         doc.build(elements)
         return pdf_path
 
@@ -1665,7 +1885,7 @@ def build_single_session_pdf(session_df):
 
     elements.append(Paragraph("Details", styles["SectionHeadingCustom"]))
     for _, row in df.iterrows():
-        elements.append(Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["MetaCustom"]))
+        elements.append(Paragraph(f"<b>{display_test_label(row)}:</b> {row['details']}", styles["MetaCustom"]))
         elements.append(Spacer(1, 4))
 
     doc.build(elements)
@@ -1678,7 +1898,7 @@ def build_single_session_pdf(session_df):
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 st.caption(
-    "Upload one Siemens IEC Constancy PDF, auto-evaluate pass/fail, "
+    "Upload one Siemens IEC Constancy PDF, parse CT IEC Constancy tests, "
     "save history with timestamp, and generate PDF reports from current or historical sessions."
 )
 
@@ -1764,26 +1984,11 @@ if uploaded_file:
         pdf_text = normalize_pdf_text(pdf_text)
         pdf_meta = extract_pdf_metadata(pdf_text)
 
-        with st.expander("DEBUG: extracted PDF text"):
-            st.text(pdf_text[:12000])
+        if DEBUG_MODE:
+            with st.expander("DEBUG: extracted PDF text"):
+                st.text(pdf_text[:16000])
 
-        debug_dump_sections(pdf_text)
-
-        with st.expander("DEBUG: header search"):
-            for pat in [
-                SECTION_PATTERNS["homogeneity_start"],
-                SECTION_PATTERNS["noise_start"],
-                SECTION_PATTERNS["mtf_start"],
-                SECTION_PATTERNS["table_start"],
-                SECTION_PATTERNS["tube_start"],
-                SECTION_PATTERNS["image_start"],
-            ]:
-                matches = list(re.finditer(pat, pdf_text, flags=re.I | re.M))
-                st.write(pat, "->", len(matches), "match(es)")
-                for m in matches:
-                    start = max(0, m.start() - 120)
-                    end = min(len(pdf_text), m.end() + 220)
-                    st.code(pdf_text[start:end])
+            debug_dump_sections(pdf_text)
 
         uploaded_file.seek(0)
         uploaded_signature = str(hash(uploaded_file.getvalue()))
@@ -1882,46 +2087,37 @@ results_df = pd.DataFrame()
 
 if uploaded_file:
     with st.spinner("Parsing IEC Constancy PDF..."):
-        with st.expander("DEBUG: section checks"):
-            st.write(
-                "Homogeneity section found:",
-                bool(extract_section(pdf_text, SECTION_PATTERNS["homogeneity_start"], SECTION_PATTERNS["noise_start"])),
-            )
-            st.write(
-                "Noise section found:",
-                bool(extract_section(pdf_text, SECTION_PATTERNS["noise_start"], SECTION_PATTERNS["mtf_start"])),
-            )
-            st.write(
-                "MTF section found:",
-                bool(extract_section(pdf_text, SECTION_PATTERNS["mtf_start"], SECTION_PATTERNS["table_start"])),
-            )
-            st.write(
-                "Table Positioning section found:",
-                bool(extract_section(pdf_text, SECTION_PATTERNS["table_start"], SECTION_PATTERNS["tube_start"])),
-            )
-            st.write(
-                "Tube Voltage section found:",
-                bool(extract_section(pdf_text, SECTION_PATTERNS["tube_start"], SECTION_PATTERNS["image_start"])),
-            )
-            st.write(
-                "Image Inspection section found:",
-                bool(extract_section(pdf_text, SECTION_PATTERNS["image_start"], None)),
-            )
-
-            st.write("Homogeneity section preview:")
-            st.code(
-                extract_section(
-                    pdf_text,
-                    SECTION_PATTERNS["homogeneity_start"],
-                    SECTION_PATTERNS["noise_start"],
-                )[:2000]
-            )
+        if DEBUG_MODE:
+            with st.expander("DEBUG: section checks"):
+                st.write(
+                    "Homogeneity section found:",
+                    bool(extract_section(pdf_text, SECTION_PATTERNS["homogeneity_start"], SECTION_PATTERNS["noise_start"])),
+                )
+                st.write(
+                    "Noise section found:",
+                    bool(extract_section(pdf_text, SECTION_PATTERNS["noise_start"], SECTION_PATTERNS["mtf_start"])),
+                )
+                st.write(
+                    "MTF section found:",
+                    bool(extract_section(pdf_text, SECTION_PATTERNS["mtf_start"], SECTION_PATTERNS["table_start"])),
+                )
+                st.write(
+                    "Table Positioning section found:",
+                    bool(extract_section(pdf_text, SECTION_PATTERNS["table_start"], SECTION_PATTERNS["tube_start"])),
+                )
+                st.write(
+                    "Tube Voltage section found:",
+                    bool(extract_section(pdf_text, SECTION_PATTERNS["tube_start"], SECTION_PATTERNS["image_start"])),
+                )
+                st.write(
+                    "Image Inspection section found:",
+                    bool(extract_section(pdf_text, SECTION_PATTERNS["image_start"], None)),
+                )
 
         parsed_results = infer_ct_parsers_from_pdf_text(pdf_text)
 
     for r in parsed_results:
         r["source_file"] = uploaded_file.name
-        r["sequence_label"] = "CT_IEC_CONSTANCY"
 
     st.session_state.parsed_results = parsed_results
     st.session_state.combined_results = parsed_results
@@ -1930,20 +2126,7 @@ if uploaded_file:
     results_df = sort_tests_ct(results_df)
 
     st.subheader("Current CT session results")
-    display_cols = [
-        c
-        for c in [
-            "source_file",
-            "sequence_label",
-            "test_name",
-            "value",
-            "unit",
-            "criteria",
-            "status",
-            "details",
-        ]
-        if c in results_df.columns
-    ]
+    display_cols = [c for c in ["test_name", "sequence_label", "value", "unit", "criteria", "status", "details", "source_file"] if c in results_df.columns]
     st.dataframe(results_df[display_cols], width="stretch")
 
     overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
@@ -2152,14 +2335,14 @@ else:
     system_df = front_trend_df[front_trend_df["scanner_id"] == selected_system].copy()
     system_df = sort_tests_ct(system_df)
 
-    test_options = system_df["test_name"].dropna().astype(str).unique().tolist()
-    test_options = sorted(test_options, key=ct_sort_key)
+    trend_options = system_df["trend_label"].dropna().astype(str).unique().tolist()
+    trend_options = sorted(trend_options)
 
     with panel_col2:
-        selected_test = st.selectbox(
-            "Select test",
-            test_options,
-            key="front_test_select",
+        selected_trend = st.selectbox(
+            "Select test / mode",
+            trend_options,
+            key="front_trend_select",
         )
 
     timestamp_options = (
@@ -2181,7 +2364,7 @@ else:
         selected_timestamp = None
         st.info("No saved session timestamps available for the selected system.")
 
-    plot_df = system_df[system_df["test_name"] == selected_test].copy().sort_values("timestamp_dt")
+    plot_df = system_df[system_df["trend_label"] == selected_trend].copy().sort_values("timestamp_dt")
     plot_df = plot_df.dropna(subset=["timestamp_dt", "value"])
 
     if plot_df.empty:
@@ -2201,11 +2384,11 @@ else:
         fig, ax = plt.subplots(figsize=(9, 4.2))
         ax.plot(plot_df["timestamp_dt"], plot_df["value"], marker="o")
         unit = plot_df["unit"].dropna().iloc[0] if not plot_df["unit"].dropna().empty else ""
-        ax.set_title(f"{selected_test} | {selected_system}")
+        ax.set_title(f"{selected_trend} | {selected_system}")
         ax.set_xlabel("Timestamp")
         ax.set_ylabel(f"Value ({unit})")
         ax.grid(True, alpha=0.3)
-        add_reference_lines_ct(ax, selected_test)
+        add_reference_lines_ct(ax, selected_trend)
         fig.autofmt_xdate()
         st.pyplot(fig)
         plt.close(fig)
@@ -2220,6 +2403,7 @@ else:
                         "scanner_id",
                         "session_label",
                         "test_name",
+                        "sequence_label",
                         "value",
                         "unit",
                         "status",
@@ -2233,7 +2417,7 @@ else:
         st.download_button(
             "Download trend CSV",
             data=csv_bytes,
-            file_name=f"{selected_test}_{selected_system}_trend.csv".replace(" ", "_").replace("/", "_"),
+            file_name=f"{selected_trend}_{selected_system}_trend.csv".replace(" ", "_").replace("/", "_"),
             mime="text/csv",
             key="download_trend_csv",
         )
