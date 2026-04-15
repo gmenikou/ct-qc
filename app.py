@@ -56,19 +56,21 @@ NUM = r"[-+]?(?:\d+(?:[.,]\d+)?|\.\d+)"
 TOL_SEP = r"(?:…|\.\.\.|\u2026|\u202f…\u202f|\s+…\s+|\s+\.\.\.\s+)"
 
 SECTION_PATTERNS = {
-    "homogeneity_start": r"(?m)^1\s+Homogeneity\s*\(IEC\s*Constancy\)\s*$",
-    "noise_start": r"(?m)^2\s+Noise\s*\(IEC\s*Constancy\)\s*$",
-    "mtf_start": r"(?m)^3\s+MTF\s*\(IEC\s*Constancy\)\s*$",
-    "table_start": r"(?m)^4\s+Table\s+Positioning\s*\(IEC\s*Constancy\)\s*$",
-    "tube_start": r"(?m)^5\s+Tube\s+Voltage\s*\(IEC\s*Constancy\)\s*$",
-    "image_start": r"(?m)^6\s+Image\s+Inspection\s*\(Constancy\)\s*$",
+    "homogeneity_start": r"(?mi)^\d+\s+Homogeneity\s*\(IEC\s*Constancy\)\s*$",
+    "noise_start": r"(?mi)^\d+\s+Noise\s*\(IEC\s*Constancy\)\s*$",
+    "mtf_start": r"(?mi)^\d+\s+MTF\s*\(IEC\s*Constancy\)\s*$",
+    "table_start": r"(?mi)^\d+\s+Table\s+Positioning\s*\(IEC\s*Constancy\)\s*$",
+    "tube_start": r"(?mi)^\d+\s+Tube\s+Voltage\s*\(IEC\s*Constancy\)\s*$",
+    "image_start": r"(?mi)^\d+\s+Image\s+Inspection\s*\(Constancy\)\s*$",
 }
 
 MODE_HEADER_PATTERNS = {
-    "homogeneity": r"(?m)^1\.3\.(\d+)\s+(.+)$",
-    "noise": r"(?m)^2\.3\.(\d+)\s+(.+)$",
-    "mtf": r"(?m)^3\.3\.(\d+)\s+(.+)$",
+    "homogeneity": r"(?mi)^\d+\.3\.(\d+)\s+(.+)$",
+    "noise": r"(?mi)^\d+\.3\.(\d+)\s+(.+)$",
+    "mtf": r"(?mi)^\d+\.3\.(\d+)\s+(.+)$",
 }
+
+TOP_LEVEL_SECTION_RE = re.compile(r"(?mi)^\d+\s+.+$")
 
 DEBUG_MODE = True
 
@@ -273,27 +275,38 @@ def extract_pdf_metadata(text: str):
     scanner_name = ""
     serial_number = ""
 
+    # Front page / header fallback
     m_head_product = re.search(
-        r"^(.*?)\nIEC Constancy\nSerial Number:\s*([A-Za-z0-9-]+)\n(.+)$",
+        r"^(.*?)\nIEC Constancy\nSerial Number:\s*([A-Za-z0-9-]+)(?:\n(.+))?$",
         clean,
         re.M,
     )
     if m_head_product:
         scanner_name = m_head_product.group(1).strip()
         serial_number = m_head_product.group(2).strip()
-        site_name = m_head_product.group(3).strip()
+        if m_head_product.group(3):
+            candidate = m_head_product.group(3).strip()
+            if candidate and "page" not in candidate.lower():
+                site_name = candidate
 
     m_prod = re.search(r"^Product Name\s+(.+?)\s*$", raw, re.I | re.M)
-    if m_prod:
+    if m_prod and m_prod.group(1).strip():
         scanner_name = " ".join(m_prod.group(1).split())
 
     m_serial = re.search(r"^Serial Number\s+(.+?)\s*$", raw, re.I | re.M)
-    if m_serial:
+    if m_serial and m_serial.group(1).strip():
         serial_number = " ".join(m_serial.group(1).split())
 
     m_hosp = re.search(r"^Hospital Name\s+(.+?)\s*$", raw, re.I | re.M)
-    if m_hosp:
+    if m_hosp and m_hosp.group(1).strip():
         site_name = " ".join(m_hosp.group(1).split())
+
+    # Customer name fallback for files with blank Hospital Name
+    m_customer = re.search(r"Customer\s+Name\s+(.+?)\s+Product\s+Name", clean, re.I | re.S)
+    if not site_name and m_customer:
+        candidate = " ".join(m_customer.group(1).split())
+        if candidate and candidate.lower() not in {"-", "na"}:
+            site_name = candidate
 
     if not site_name:
         m_footer = re.search(
@@ -339,6 +352,47 @@ def extract_section(text, start_pattern, end_pattern=None):
             return text[start_idx:end_idx]
 
     return text[start_idx:]
+
+
+def extract_section_by_title(text: str, title_regex: str) -> str:
+    text = normalize_pdf_text(text)
+
+    start_match = re.search(title_regex, text, flags=re.I | re.M)
+    if not start_match:
+        return ""
+
+    start_idx = start_match.start()
+    later_text = text[start_match.end() :]
+    next_matches = list(TOP_LEVEL_SECTION_RE.finditer(later_text))
+
+    if next_matches:
+        end_idx = start_match.end() + next_matches[0].start()
+        return text[start_idx:end_idx]
+
+    return text[start_idx:]
+
+
+def locate_sections(text: str):
+    text = normalize_pdf_text(text)
+    titles = {
+        "homogeneity": SECTION_PATTERNS["homogeneity_start"],
+        "noise": SECTION_PATTERNS["noise_start"],
+        "mtf": SECTION_PATTERNS["mtf_start"],
+        "table_positioning": SECTION_PATTERNS["table_start"],
+        "tube_voltage": SECTION_PATTERNS["tube_start"],
+        "image_inspection": SECTION_PATTERNS["image_start"],
+    }
+
+    found = {}
+    for key, pattern in titles.items():
+        section = extract_section_by_title(text, pattern)
+        if section.strip():
+            found[key] = section
+    return found
+
+
+def scan_top_level_sections(text: str):
+    return re.findall(r"(?mi)^\d+\s+.+$", normalize_pdf_text(text))
 
 
 def iter_clean_lines(section):
@@ -430,6 +484,9 @@ def debug_dump_sections(pdf_text):
     }
 
     with st.expander("DEBUG: section match dump"):
+        st.write("Top-level sections found:")
+        st.write(scan_top_level_sections(pdf_text))
+
         for name, pattern in sections.items():
             matches = list(re.finditer(pattern, pdf_text, flags=re.I | re.M))
             st.write(f"### {name}")
@@ -445,25 +502,16 @@ def debug_dump_sections(pdf_text):
 # CT PARSERS
 # =========================================================
 def parse_ct_water_value_and_homogeneity(text):
-    section = extract_section(
-        text,
-        SECTION_PATTERNS["homogeneity_start"],
-        SECTION_PATTERNS["noise_start"],
-    )
+    section = extract_section_by_title(text, SECTION_PATTERNS["homogeneity_start"])
     mode_blocks = split_mode_blocks(section, MODE_HEADER_PATTERNS["homogeneity"])
 
     results = []
     for mode_name, block in mode_blocks:
         lines = list(iter_clean_lines(block))
 
-        # -------------------------------------------------
+        # ----------------------------
         # WATER VALUE
-        # Handles:
-        # 1) "Reference Tolerance" inline rows
-        # 2) "Tolerance: ... Reference" header + simple rows
-        # Includes typical body mode and typical head mode
-        # 120 kV water value blocks.
-        # -------------------------------------------------
+        # ----------------------------
         water_rows = []
         current_low, current_high = None, None
         in_water = False
@@ -473,7 +521,6 @@ def parse_ct_water_value_and_homogeneity(text):
                 in_water = True
                 continue
 
-            # Leave water rows when slice detail block begins
             if re.match(r"^Slice\s+\d+$", line, re.I):
                 in_water = False
 
@@ -485,7 +532,6 @@ def parse_ct_water_value_and_homogeneity(text):
             if not in_water:
                 continue
 
-            # Format: slice result reference low...high
             m_inline = re.search(
                 rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})$",
                 line,
@@ -503,8 +549,6 @@ def parse_ct_water_value_and_homogeneity(text):
                 water_rows.append(row)
                 continue
 
-            # Format after header tolerance:
-            # slice result reference
             m_simple = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})$", line, re.I)
             if m_simple and current_low is not None and current_high is not None:
                 row = {
@@ -538,11 +582,9 @@ def parse_ct_water_value_and_homogeneity(text):
                 )
             )
 
-        # -------------------------------------------------
+        # ----------------------------
         # HOMOGENEITY
-        # Captures Diff.* rows per slice, including blocks
-        # split across pages for typical body/head modes.
-        # -------------------------------------------------
+        # ----------------------------
         diff_rows = []
         current_slice = None
         current_low, current_high = -4.0, 4.0
@@ -558,7 +600,7 @@ def parse_ct_water_value_and_homogeneity(text):
                 current_low, current_high = low, high
                 continue
 
-            # Center rows are not homogeneity outputs, ignore but keep slice context
+            # Ignore center rows for homogeneity result rollup
             m_center_inline = re.search(
                 rf"^Center\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})$",
                 line,
@@ -626,11 +668,7 @@ def parse_ct_water_value_and_homogeneity(text):
 
 
 def parse_ct_noise(text):
-    section = extract_section(
-        text,
-        SECTION_PATTERNS["noise_start"],
-        SECTION_PATTERNS["mtf_start"],
-    )
+    section = extract_section_by_title(text, SECTION_PATTERNS["noise_start"])
     mode_blocks = split_mode_blocks(section, MODE_HEADER_PATTERNS["noise"])
 
     results = []
@@ -682,11 +720,7 @@ def parse_ct_noise(text):
 
 
 def parse_ct_mtf(text):
-    section = extract_section(
-        text,
-        SECTION_PATTERNS["mtf_start"],
-        SECTION_PATTERNS["table_start"],
-    )
+    section = extract_section_by_title(text, SECTION_PATTERNS["mtf_start"])
     mode_blocks = split_mode_blocks(section, MODE_HEADER_PATTERNS["mtf"])
 
     results = []
@@ -704,7 +738,6 @@ def parse_ct_mtf(text):
         while i < len(lines):
             line = lines[i]
 
-            # Standard combined tolerance line
             m_tol_combined = re.search(
                 rf"Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})\s+Reference\s+Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})",
                 line,
@@ -716,29 +749,22 @@ def parse_ct_mtf(text):
                 i += 1
                 continue
 
-            # Sharpest mode special layout:
-            # Reference: 12.20
-            # Tolerance: 10.79 … 13.19
-            # Reference: 14.52
-            # Tolerance: 13.07 … 15.97
+            # Sharpest mode special layout
             m_ref = re.search(rf"^Reference:\s*({NUM})$", line, re.I)
             if m_ref:
                 first_ref = safe_float(m_ref.group(1))
 
+                low1, high1 = (None, None)
                 if i + 1 < len(lines):
                     low1, high1 = parse_tolerance_line(lines[i + 1])
-                else:
-                    low1, high1 = None, None
 
+                m_ref2 = None
                 if i + 2 < len(lines):
                     m_ref2 = re.search(rf"^Reference:\s*({NUM})$", lines[i + 2], re.I)
-                else:
-                    m_ref2 = None
 
+                low2, high2 = (None, None)
                 if i + 3 < len(lines):
                     low2, high2 = parse_tolerance_line(lines[i + 3])
-                else:
-                    low2, high2 = (None, None)
 
                 if low1 is not None and high1 is not None and m_ref2 and low2 is not None and high2 is not None:
                     ref50 = first_ref
@@ -748,7 +774,6 @@ def parse_ct_mtf(text):
                     i += 4
                     continue
 
-            # Standard 5-column row
             m_row = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})$", line, re.I)
             if m_row:
                 slice_no = int(m_row.group(1))
@@ -780,7 +805,6 @@ def parse_ct_mtf(text):
                 i += 1
                 continue
 
-            # Sharpest mode single-slice row
             m_sharp = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})$", line, re.I)
             if m_sharp and tol50[0] is not None and tol10[0] is not None:
                 slice_no = int(m_sharp.group(1))
@@ -858,13 +882,8 @@ def parse_ct_mtf(text):
 
 
 def parse_ct_table_positioning(text):
-    section = extract_section(
-        text,
-        SECTION_PATTERNS["table_start"],
-        SECTION_PATTERNS["tube_start"],
-    )
+    section = extract_section_by_title(text, SECTION_PATTERNS["table_start"])
 
-    # Nominal positions for Siemens IEC table test
     nominal_map = {
         1: -300.0,
         2: 0.0,
@@ -975,11 +994,9 @@ def parse_ct_table_positioning(text):
 
 
 def parse_ct_tube_voltage(text):
-    section = extract_section(
-        text,
-        SECTION_PATTERNS["tube_start"],
-        SECTION_PATTERNS["image_start"],
-    )
+    section = extract_section_by_title(text, SECTION_PATTERNS["tube_start"])
+    if not section.strip():
+        return []
 
     rows = []
     for line in iter_clean_lines(section):
@@ -1032,7 +1049,10 @@ def parse_ct_tube_voltage(text):
 
 
 def parse_ct_image_inspection(text):
-    section = extract_section(text, SECTION_PATTERNS["image_start"], None)
+    section = extract_section_by_title(text, SECTION_PATTERNS["image_start"])
+    if not section.strip():
+        return []
+
     accept = len(re.findall(r"\bAccept\b", section, flags=re.I))
     reject = len(re.findall(r"\bReject\b|\bFail\b", section, flags=re.I))
 
@@ -1052,12 +1072,26 @@ def parse_ct_image_inspection(text):
 
 def infer_ct_parsers_from_pdf_text(text):
     results = []
-    results.extend(parse_ct_water_value_and_homogeneity(text))
-    results.extend(parse_ct_noise(text))
-    results.extend(parse_ct_mtf(text))
-    results.extend(parse_ct_table_positioning(text))
-    results.extend(parse_ct_tube_voltage(text))
-    results.extend(parse_ct_image_inspection(text))
+    found = locate_sections(text)
+
+    if "homogeneity" in found:
+        results.extend(parse_ct_water_value_and_homogeneity(text))
+
+    if "noise" in found:
+        results.extend(parse_ct_noise(text))
+
+    if "mtf" in found:
+        results.extend(parse_ct_mtf(text))
+
+    if "table_positioning" in found:
+        results.extend(parse_ct_table_positioning(text))
+
+    if "tube_voltage" in found:
+        results.extend(parse_ct_tube_voltage(text))
+
+    if "image_inspection" in found:
+        results.extend(parse_ct_image_inspection(text))
+
     return results
 
 
@@ -2199,30 +2233,10 @@ if uploaded_file:
     with st.spinner("Parsing IEC Constancy PDF..."):
         if DEBUG_MODE:
             with st.expander("DEBUG: section checks"):
-                st.write(
-                    "Homogeneity section found:",
-                    bool(extract_section(pdf_text, SECTION_PATTERNS["homogeneity_start"], SECTION_PATTERNS["noise_start"])),
-                )
-                st.write(
-                    "Noise section found:",
-                    bool(extract_section(pdf_text, SECTION_PATTERNS["noise_start"], SECTION_PATTERNS["mtf_start"])),
-                )
-                st.write(
-                    "MTF section found:",
-                    bool(extract_section(pdf_text, SECTION_PATTERNS["mtf_start"], SECTION_PATTERNS["table_start"])),
-                )
-                st.write(
-                    "Table Positioning section found:",
-                    bool(extract_section(pdf_text, SECTION_PATTERNS["table_start"], SECTION_PATTERNS["tube_start"])),
-                )
-                st.write(
-                    "Tube Voltage section found:",
-                    bool(extract_section(pdf_text, SECTION_PATTERNS["tube_start"], SECTION_PATTERNS["image_start"])),
-                )
-                st.write(
-                    "Image Inspection section found:",
-                    bool(extract_section(pdf_text, SECTION_PATTERNS["image_start"], None)),
-                )
+                found_sections = locate_sections(pdf_text)
+                st.write("Located sections:", list(found_sections.keys()))
+                for k, v in found_sections.items():
+                    st.write(f"{k}: {bool(v.strip())}")
 
         parsed_results = infer_ct_parsers_from_pdf_text(pdf_text)
 
@@ -2236,11 +2250,14 @@ if uploaded_file:
     results_df = sort_tests_ct(results_df)
 
     st.subheader("Current CT session results")
-    display_cols = [c for c in ["test_name", "sequence_label", "value", "unit", "criteria", "status", "details", "source_file"] if c in results_df.columns]
-    st.dataframe(results_df[display_cols], width="stretch")
+    if not results_df.empty:
+        display_cols = [c for c in ["test_name", "sequence_label", "value", "unit", "criteria", "status", "details", "source_file"] if c in results_df.columns]
+        st.dataframe(results_df[display_cols], width="stretch")
 
-    overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
-    st.metric("Overall session result", overall)
+        overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
+        st.metric("Overall session result", overall)
+    else:
+        st.warning("No CT QC results could be parsed from this PDF.")
 
     col1, col2, col3 = st.columns(3)
 
@@ -2248,6 +2265,8 @@ if uploaded_file:
         if st.button("Save session to history", type="primary", key="save_session_to_history"):
             if not site_name.strip() or not scanner_name.strip():
                 st.error("Please enter both Site / Hospital and Scanner / System.")
+            elif results_df.empty:
+                st.error("No parsed results available to save.")
             else:
                 history_after_save, save_err = save_results_with_lock(
                     parsed_results,
@@ -2271,6 +2290,8 @@ if uploaded_file:
         if st.button("Generate PDF report", key="generate_pdf_report"):
             if not site_name.strip() or not scanner_name.strip():
                 st.error("Please enter both Site / Hospital and Scanner / System.")
+            elif results_df.empty:
+                st.error("No parsed results available to report.")
             else:
                 temp_history = history_df.copy()
                 if uploaded_file and parsed_results:
