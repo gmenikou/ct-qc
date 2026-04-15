@@ -224,11 +224,18 @@ def ct_sort_key(test_name):
 
 
 def sort_tests_ct(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty or "test_name" not in df.columns:
+    if df is None or df.empty:
         return df
+    if "test_name" not in df.columns:
+        return df
+
     out = df.copy()
     out["_ct_order"] = out["test_name"].apply(ct_sort_key)
-    out = out.sort_values(["_ct_order", "sequence_label", "timestamp"], na_position="last").drop(columns=["_ct_order"])
+
+    preferred_cols = ["_ct_order", "sequence_label", "timestamp"]
+    sort_cols = [c for c in preferred_cols if c in out.columns]
+
+    out = out.sort_values(sort_cols, na_position="last").drop(columns=["_ct_order"])
     return out
 
 
