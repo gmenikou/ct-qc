@@ -456,7 +456,14 @@ def parse_ct_water_value_and_homogeneity(text):
     for mode_name, block in mode_blocks:
         lines = list(iter_clean_lines(block))
 
-        # -------- Water Value --------
+        # -------------------------------------------------
+        # WATER VALUE
+        # Handles:
+        # 1) "Reference Tolerance" inline rows
+        # 2) "Tolerance: ... Reference" header + simple rows
+        # Includes typical body mode and typical head mode
+        # 120 kV water value blocks.
+        # -------------------------------------------------
         water_rows = []
         current_low, current_high = None, None
         in_water = False
@@ -466,6 +473,7 @@ def parse_ct_water_value_and_homogeneity(text):
                 in_water = True
                 continue
 
+            # Leave water rows when slice detail block begins
             if re.match(r"^Slice\s+\d+$", line, re.I):
                 in_water = False
 
@@ -477,36 +485,37 @@ def parse_ct_water_value_and_homogeneity(text):
             if not in_water:
                 continue
 
+            # Format: slice result reference low...high
             m_inline = re.search(
                 rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})$",
                 line,
                 re.I,
             )
             if m_inline:
-                water_rows.append(
-                    {
-                        "slice": int(m_inline.group(1)),
-                        "value": safe_float(m_inline.group(2)),
-                        "reference": safe_float(m_inline.group(3)),
-                        "low": safe_float(m_inline.group(4)),
-                        "high": safe_float(m_inline.group(5)),
-                    }
-                )
-                water_rows[-1]["status"] = row_status(water_rows[-1]["value"], water_rows[-1]["low"], water_rows[-1]["high"])
+                row = {
+                    "slice": int(m_inline.group(1)),
+                    "value": safe_float(m_inline.group(2)),
+                    "reference": safe_float(m_inline.group(3)),
+                    "low": safe_float(m_inline.group(4)),
+                    "high": safe_float(m_inline.group(5)),
+                }
+                row["status"] = row_status(row["value"], row["low"], row["high"])
+                water_rows.append(row)
                 continue
 
+            # Format after header tolerance:
+            # slice result reference
             m_simple = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})$", line, re.I)
             if m_simple and current_low is not None and current_high is not None:
-                water_rows.append(
-                    {
-                        "slice": int(m_simple.group(1)),
-                        "value": safe_float(m_simple.group(2)),
-                        "reference": safe_float(m_simple.group(3)),
-                        "low": current_low,
-                        "high": current_high,
-                    }
-                )
-                water_rows[-1]["status"] = row_status(water_rows[-1]["value"], water_rows[-1]["low"], water_rows[-1]["high"])
+                row = {
+                    "slice": int(m_simple.group(1)),
+                    "value": safe_float(m_simple.group(2)),
+                    "reference": safe_float(m_simple.group(3)),
+                    "low": current_low,
+                    "high": current_high,
+                }
+                row["status"] = row_status(row["value"], row["low"], row["high"])
+                water_rows.append(row)
 
         if water_rows:
             worst, overall_status = summarize_slice_rows(water_rows, "Water Value", worst_by="max_abs")
@@ -529,10 +538,14 @@ def parse_ct_water_value_and_homogeneity(text):
                 )
             )
 
-        # -------- Homogeneity --------
+        # -------------------------------------------------
+        # HOMOGENEITY
+        # Captures Diff.* rows per slice, including blocks
+        # split across pages for typical body/head modes.
+        # -------------------------------------------------
         diff_rows = []
         current_slice = None
-        current_low, current_high = None, None
+        current_low, current_high = -4.0, 4.0
 
         for line in lines:
             m_slice = re.match(r"^Slice\s+(\d+)$", line, re.I)
@@ -542,39 +555,49 @@ def parse_ct_water_value_and_homogeneity(text):
 
             low, high = parse_tolerance_line(line)
             if low is not None and high is not None:
-                # Homogeneity acceptance is fixed ±4 HU, even if water value rows in same section use ±6.
                 current_low, current_high = low, high
                 continue
 
-            m_inline = re.search(
+            # Center rows are not homogeneity outputs, ignore but keep slice context
+            m_center_inline = re.search(
+                rf"^Center\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})$",
+                line,
+                re.I,
+            )
+            if m_center_inline:
+                continue
+
+            m_center_simple = re.search(rf"^Center\s+({NUM})\s+({NUM})$", line, re.I)
+            if m_center_simple:
+                continue
+
+            m_diff_inline = re.search(
                 rf"^(Diff\.\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})$",
                 line,
                 re.I,
             )
-            if m_inline:
+            if m_diff_inline and current_slice is not None:
                 row = {
                     "slice": current_slice,
-                    "position": m_inline.group(1),
-                    "value": safe_float(m_inline.group(2)),
-                    "reference": safe_float(m_inline.group(3)),
-                    "low": safe_float(m_inline.group(4)),
-                    "high": safe_float(m_inline.group(5)),
+                    "position": m_diff_inline.group(1),
+                    "value": safe_float(m_diff_inline.group(2)),
+                    "reference": safe_float(m_diff_inline.group(3)),
+                    "low": safe_float(m_diff_inline.group(4)),
+                    "high": safe_float(m_diff_inline.group(5)),
                 }
                 row["status"] = row_status(row["value"], row["low"], row["high"])
                 diff_rows.append(row)
                 continue
 
-            m_simple = re.search(rf"^(Diff\.\d+)\s+({NUM})\s+({NUM})$", line, re.I)
-            if m_simple and current_slice is not None:
-                low = current_low if current_low is not None else -4.0
-                high = current_high if current_high is not None else 4.0
+            m_diff_simple = re.search(rf"^(Diff\.\d+)\s+({NUM})\s+({NUM})$", line, re.I)
+            if m_diff_simple and current_slice is not None:
                 row = {
                     "slice": current_slice,
-                    "position": m_simple.group(1),
-                    "value": safe_float(m_simple.group(2)),
-                    "reference": safe_float(m_simple.group(3)),
-                    "low": low,
-                    "high": high,
+                    "position": m_diff_simple.group(1),
+                    "value": safe_float(m_diff_simple.group(2)),
+                    "reference": safe_float(m_diff_simple.group(3)),
+                    "low": current_low if current_low is not None else -4.0,
+                    "high": current_high if current_high is not None else 4.0,
                 }
                 row["status"] = row_status(row["value"], row["low"], row["high"])
                 diff_rows.append(row)
@@ -668,36 +691,101 @@ def parse_ct_mtf(text):
 
     results = []
     for mode_name, block in mode_blocks:
+        lines = list(iter_clean_lines(block))
+
         tol50 = (None, None)
         tol10 = (None, None)
+        ref50 = None
+        ref10 = None
         rows50 = []
         rows10 = []
 
-        for line in iter_clean_lines(block):
-            m_tol = re.search(
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # Standard combined tolerance line
+            m_tol_combined = re.search(
                 rf"Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})\s+Reference\s+Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})",
                 line,
                 re.I,
             )
-            if m_tol:
-                tol50 = (safe_float(m_tol.group(1)), safe_float(m_tol.group(2)))
-                tol10 = (safe_float(m_tol.group(3)), safe_float(m_tol.group(4)))
+            if m_tol_combined:
+                tol50 = (safe_float(m_tol_combined.group(1)), safe_float(m_tol_combined.group(2)))
+                tol10 = (safe_float(m_tol_combined.group(3)), safe_float(m_tol_combined.group(4)))
+                i += 1
                 continue
 
-            if ("Tolerance" in line and "Reference Tolerance" in line) or ("Tolerance" in line and "Reference" in line and "..." in line):
-                nums = [safe_float(x) for x in re.findall(NUM, line)]
-                if len(nums) >= 4:
-                    tol50 = (nums[0], nums[1])
-                    tol10 = (nums[2], nums[3])
+            # Sharpest mode special layout:
+            # Reference: 12.20
+            # Tolerance: 10.79 … 13.19
+            # Reference: 14.52
+            # Tolerance: 13.07 … 15.97
+            m_ref = re.search(rf"^Reference:\s*({NUM})$", line, re.I)
+            if m_ref:
+                first_ref = safe_float(m_ref.group(1))
+
+                if i + 1 < len(lines):
+                    low1, high1 = parse_tolerance_line(lines[i + 1])
+                else:
+                    low1, high1 = None, None
+
+                if i + 2 < len(lines):
+                    m_ref2 = re.search(rf"^Reference:\s*({NUM})$", lines[i + 2], re.I)
+                else:
+                    m_ref2 = None
+
+                if i + 3 < len(lines):
+                    low2, high2 = parse_tolerance_line(lines[i + 3])
+                else:
+                    low2, high2 = (None, None)
+
+                if low1 is not None and high1 is not None and m_ref2 and low2 is not None and high2 is not None:
+                    ref50 = first_ref
+                    tol50 = (low1, high1)
+                    ref10 = safe_float(m_ref2.group(1))
+                    tol10 = (low2, high2)
+                    i += 4
                     continue
 
+            # Standard 5-column row
             m_row = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})$", line, re.I)
             if m_row:
                 slice_no = int(m_row.group(1))
                 val50 = safe_float(m_row.group(2))
-                ref50 = safe_float(m_row.group(3))
+                ref50_row = safe_float(m_row.group(3))
                 val10 = safe_float(m_row.group(4))
-                ref10 = safe_float(m_row.group(5))
+                ref10_row = safe_float(m_row.group(5))
+
+                row50 = {
+                    "slice": slice_no,
+                    "value": val50,
+                    "reference": ref50_row,
+                    "low": tol50[0],
+                    "high": tol50[1],
+                }
+                row50["status"] = row_status(row50["value"], row50["low"], row50["high"])
+                rows50.append(row50)
+
+                row10 = {
+                    "slice": slice_no,
+                    "value": val10,
+                    "reference": ref10_row,
+                    "low": tol10[0],
+                    "high": tol10[1],
+                }
+                row10["status"] = row_status(row10["value"], row10["low"], row10["high"])
+                rows10.append(row10)
+
+                i += 1
+                continue
+
+            # Sharpest mode single-slice row
+            m_sharp = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})$", line, re.I)
+            if m_sharp and tol50[0] is not None and tol10[0] is not None:
+                slice_no = int(m_sharp.group(1))
+                val50 = safe_float(m_sharp.group(2))
+                val10 = safe_float(m_sharp.group(3))
 
                 row50 = {
                     "slice": slice_no,
@@ -718,34 +806,11 @@ def parse_ct_mtf(text):
                 }
                 row10["status"] = row_status(row10["value"], row10["low"], row10["high"])
                 rows10.append(row10)
+
+                i += 1
                 continue
 
-            # Sharpest mode fallback: slice value50 value10
-            m_sharp = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})$", line, re.I)
-            if m_sharp and tol50[0] is not None and tol10[0] is not None:
-                slice_no = int(m_sharp.group(1))
-                val50 = safe_float(m_sharp.group(2))
-                val10 = safe_float(m_sharp.group(3))
-
-                row50 = {
-                    "slice": slice_no,
-                    "value": val50,
-                    "reference": None,
-                    "low": tol50[0],
-                    "high": tol50[1],
-                }
-                row50["status"] = row_status(row50["value"], row50["low"], row50["high"])
-                rows50.append(row50)
-
-                row10 = {
-                    "slice": slice_no,
-                    "value": val10,
-                    "reference": None,
-                    "low": tol10[0],
-                    "high": tol10[1],
-                }
-                row10["status"] = row_status(row10["value"], row10["low"], row10["high"])
-                rows10.append(row10)
+            i += 1
 
         if rows50:
             worst50, status50 = summarize_slice_rows(rows50, "MTF 50%", worst_by="min")
@@ -799,6 +864,14 @@ def parse_ct_table_positioning(text):
         SECTION_PATTERNS["tube_start"],
     )
 
+    # Nominal positions for Siemens IEC table test
+    nominal_map = {
+        1: -300.0,
+        2: 0.0,
+        3: 300.0,
+        4: 0.0,
+    }
+
     cont_rows = []
     step_rows = []
 
@@ -812,59 +885,89 @@ def parse_ct_table_positioning(text):
             continue
 
         pos = int(m.group(1))
-        cont = safe_float(m.group(2))
+        nominal = nominal_map.get(pos)
+
+        cont_measured = safe_float(m.group(2))
         cont_low = safe_float(m.group(3))
         cont_high = safe_float(m.group(4))
-        step = safe_float(m.group(5))
+
+        step_measured = safe_float(m.group(5))
         step_low = safe_float(m.group(6))
         step_high = safe_float(m.group(7))
 
-        rowc = {"position": pos, "value": cont, "low": cont_low, "high": cont_high}
-        rowc["status"] = row_status(rowc["value"], rowc["low"], rowc["high"])
+        cont_dev = cont_measured - nominal if nominal is not None else None
+        step_dev = step_measured - nominal if nominal is not None else None
+
+        rowc = {
+            "position": pos,
+            "nominal": nominal,
+            "measured": cont_measured,
+            "value": abs(cont_dev) if cont_dev is not None else None,
+            "deviation": cont_dev,
+            "low": cont_low,
+            "high": cont_high,
+        }
+        rowc["status"] = row_status(rowc["measured"], rowc["low"], rowc["high"])
         cont_rows.append(rowc)
 
-        rows = {"position": pos, "value": step, "low": step_low, "high": step_high}
-        rows["status"] = row_status(rows["value"], rows["low"], rows["high"])
+        rows = {
+            "position": pos,
+            "nominal": nominal,
+            "measured": step_measured,
+            "value": abs(step_dev) if step_dev is not None else None,
+            "deviation": step_dev,
+            "low": step_low,
+            "high": step_high,
+        }
+        rows["status"] = row_status(rows["measured"], rows["low"], rows["high"])
         step_rows.append(rows)
 
     results = []
     if cont_rows:
-        worst = max(cont_rows, key=lambda x: abs(x["value"]))
-        status = "PASS" if abs(worst["value"]) <= 1.0 and all(r["status"] == "PASS" for r in cont_rows) else "FAIL"
+        worst = max(cont_rows, key=lambda x: abs(x["deviation"]) if x["deviation"] is not None else -1)
+        overall_status = "PASS" if all(r["status"] == "PASS" for r in cont_rows) else "FAIL"
         pos_summary = "; ".join(
-            f"P{r['position']}={format_num(r['value'])} mm [{format_num(r['low'],2)},{format_num(r['high'],2)}] {r['status']}"
+            f"P{r['position']}: nominal={format_num(r['nominal'])} mm, "
+            f"measured={format_num(r['measured'])} mm, "
+            f"Δ={format_num(r['deviation'])} mm, "
+            f"allowed [{format_num(r['low'],2)},{format_num(r['high'],2)}], {r['status']}"
             for r in cont_rows
         )
         results.append(
             make_result(
                 "Table Positioning (Continuous)",
                 "Continuous movement",
-                abs(worst["value"]),
+                abs(worst["deviation"]),
                 "mm",
-                "Worst result within ±1 mm of expected position",
-                status,
-                f"Worst continuous result at position {worst['position']} = {format_num(worst['value'])} mm. "
-                f"All positions: {pos_summary}",
+                "At each of 4 positions, measured table position must be within ±1 mm of nominal",
+                overall_status,
+                f"Worst continuous deviation at position {worst['position']}: "
+                f"nominal {format_num(worst['nominal'])} mm, measured {format_num(worst['measured'])} mm, "
+                f"Δ={format_num(worst['deviation'])} mm. All positions: {pos_summary}",
             )
         )
 
     if step_rows:
-        worst = max(step_rows, key=lambda x: abs(x["value"]))
-        status = "PASS" if abs(worst["value"]) <= 1.0 and all(r["status"] == "PASS" for r in step_rows) else "FAIL"
+        worst = max(step_rows, key=lambda x: abs(x["deviation"]) if x["deviation"] is not None else -1)
+        overall_status = "PASS" if all(r["status"] == "PASS" for r in step_rows) else "FAIL"
         pos_summary = "; ".join(
-            f"P{r['position']}={format_num(r['value'])} mm [{format_num(r['low'],2)},{format_num(r['high'],2)}] {r['status']}"
+            f"P{r['position']}: nominal={format_num(r['nominal'])} mm, "
+            f"measured={format_num(r['measured'])} mm, "
+            f"Δ={format_num(r['deviation'])} mm, "
+            f"allowed [{format_num(r['low'],2)},{format_num(r['high'],2)}], {r['status']}"
             for r in step_rows
         )
         results.append(
             make_result(
                 "Table Positioning (Stepwise)",
                 "Stepwise movement",
-                abs(worst["value"]),
+                abs(worst["deviation"]),
                 "mm",
-                "Worst result within ±1 mm of expected position",
-                status,
-                f"Worst stepwise result at position {worst['position']} = {format_num(worst['value'])} mm. "
-                f"All positions: {pos_summary}",
+                "At each of 4 positions, measured table position must be within ±1 mm of nominal",
+                overall_status,
+                f"Worst stepwise deviation at position {worst['position']}: "
+                f"nominal {format_num(worst['nominal'])} mm, measured {format_num(worst['measured'])} mm, "
+                f"Δ={format_num(worst['deviation'])} mm. All positions: {pos_summary}",
             )
         )
 
