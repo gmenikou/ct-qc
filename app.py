@@ -49,25 +49,34 @@ DATA_DIR.mkdir(exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 CHARTS_DIR.mkdir(exist_ok=True)
 
-
 # =========================================================
 # HELPERS
 # =========================================================
-TOL_SEP = r"(?:…|\.\.\.|\u2026|\u202f…\u202f|\s+…\s+)"
+NUM = r"[-+]?(?:\d+(?:[.,]\d+)?|\.\d+)"
+TOL_SEP = r"(?:…|\.\.\.|\u2026|\u202f…\u202f|\s+…\s+|\s+\.\.\.\s+)"
+
+SECTION_PATTERNS = {
+    "homogeneity_start": r"1\s+Homogeneity\s*\(IEC\s*Constancy\)",
+    "noise_start": r"2\s+Noise\s*\(IEC\s*Constancy\)",
+    "mtf_start": r"3\s+MTF\s*\(IEC\s*Constancy\)",
+    "table_start": r"4\s+Table\s+Positioning\s*\(IEC\s*Constancy\)",
+    "tube_start": r"5\s+Tube\s+Voltage\s*\(IEC\s*Constancy\)",
+    "image_start": r"6\s+Image\s+Inspection\s*\(Constancy\)",
+}
 
 def normalize_pdf_text(text):
     return (
-        text.replace("\u202f", " ")   # narrow no-break space
-            .replace("\xa0", " ")     # non-breaking space
-            .replace("…", "...")      # unicode ellipsis → "..."
+        str(text)
+        .replace("\u202f", " ")
+        .replace("\xa0", " ")
+        .replace("…", "...")
     )
+
 def safe_float(text):
     try:
         return float(str(text).replace(",", ".").strip())
     except Exception:
         return None
-
-
 
 def validate_iso_timestamp(ts: str) -> bool:
     try:
@@ -76,24 +85,16 @@ def validate_iso_timestamp(ts: str) -> bool:
     except Exception:
         return False
 
-
-
 def build_scanner_id(site_name: str, scanner_name: str) -> str:
     raw = f"{str(site_name).strip()}__{str(scanner_name).strip()}".lower()
     raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
     return raw or "unknown_scanner"
 
-
-
 def sanitize_filename(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", str(text or "").strip()) or "file"
 
-
-
 def normalize_ws(text: str) -> str:
     return "\n".join(" ".join(line.replace("\u202f", " ").split()) for line in str(text).splitlines())
-
-
 
 def get_history_columns():
     return [
@@ -112,12 +113,8 @@ def get_history_columns():
         "sequence_label",
     ]
 
-
-
 def empty_history_df():
     return pd.DataFrame(columns=get_history_columns())
-
-
 
 def normalize_history_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -157,8 +154,6 @@ def normalize_history_df(df: pd.DataFrame) -> pd.DataFrame:
 
     return df[get_history_columns()]
 
-
-
 def github_is_ready(cfg):
     return bool(
         cfg
@@ -169,8 +164,6 @@ def github_is_ready(cfg):
         and cfg["owner"] != "YOUR_GITHUB_USERNAME"
         and cfg["repo"] != "YOUR_REPO_NAME"
     )
-
-
 
 def get_ct_test_order():
     return [
@@ -183,15 +176,11 @@ def get_ct_test_order():
         "Image Inspection",
     ]
 
-
-
 def ct_sort_key(test_name):
     order = get_ct_test_order()
     if test_name in order:
         return (order.index(test_name), str(test_name))
     return (999, str(test_name))
-
-
 
 def sort_tests_ct(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or "test_name" not in df.columns:
@@ -200,8 +189,6 @@ def sort_tests_ct(df: pd.DataFrame) -> pd.DataFrame:
     out["_ct_order"] = out["test_name"].apply(ct_sort_key)
     out = out.sort_values("_ct_order").drop(columns=["_ct_order"])
     return out
-
-
 
 def build_single_session_df(history_df, scanner_id, timestamp):
     df = normalize_history_df(history_df).copy()
@@ -213,8 +200,6 @@ def build_single_session_df(history_df, scanner_id, timestamp):
         & (df["timestamp"].astype(str) == str(timestamp))
     ].copy()
     return sort_tests_ct(out)
-
-
 
 def read_pdf_text(uploaded_file):
     uploaded_file.seek(0)
@@ -229,36 +214,47 @@ def read_pdf_text(uploaded_file):
     uploaded_file.seek(0)
     return "\n\n".join(pages)
 
-
-
 def extract_pdf_metadata(text: str):
+    raw = str(text)
     clean = normalize_ws(text)
 
     site_name = ""
     scanner_name = ""
     serial_number = ""
 
-    # Header page fallback
-    m_head_product = re.search(r"^(.*?)\nIEC Constancy\nSerial Number:\s*([A-Za-z0-9-]+)\n(.+)$", clean, re.M)
+    m_head_product = re.search(
+        r"^(.*?)\nIEC Constancy\nSerial Number:\s*([A-Za-z0-9-]+)\n(.+)$",
+        clean,
+        re.M,
+    )
     if m_head_product:
         scanner_name = m_head_product.group(1).strip()
         serial_number = m_head_product.group(2).strip()
         site_name = m_head_product.group(3).strip()
 
-    # Demographics page is the more reliable source
-    m_prod = re.search(r"Product Name\s+([A-Za-z0-9._\-]+(?:\s+[A-Za-z0-9._\-]+)*)", clean, re.I)
+    m_prod = re.search(r"^Product Name\s+(.+?)\s*$", raw, re.I | re.M)
     if m_prod:
-        scanner_name = m_prod.group(1).strip()
+        scanner_name = " ".join(m_prod.group(1).split())
 
-    m_serial = re.search(r"Serial Number\s+([A-Za-z0-9\-]+)", clean, re.I)
+    m_serial = re.search(r"^Serial Number\s+(.+?)\s*$", raw, re.I | re.M)
     if m_serial:
-        serial_number = m_serial.group(1).strip()
+        serial_number = " ".join(m_serial.group(1).split())
 
-    m_hosp = re.search(r"Hospital Name\s+([A-Za-z0-9 .&/\-]+(?:\s+[A-Za-z0-9 .&/\-]+)*)", clean, re.I)
+    m_hosp = re.search(r"^Hospital Name\s+(.+?)\s*$", raw, re.I | re.M)
     if m_hosp:
-        site_name = m_hosp.group(1).strip()
+        site_name = " ".join(m_hosp.group(1).split())
 
-    # Footer timestamp appears on many pages
+    if not site_name:
+        m_footer = re.search(
+            r"([A-Z][A-Z0-9 .&/\-]+)\s+\|\s+([A-Za-z0-9._\- ]+)\s+\|\s+Serial Number:\s*([A-Za-z0-9\-]+)",
+            clean,
+            re.I,
+        )
+        if m_footer:
+            site_name = m_footer.group(1).strip()
+            scanner_name = scanner_name or m_footer.group(2).strip()
+            serial_number = serial_number or m_footer.group(3).strip()
+
     m_ts = re.search(r"(\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)", clean, re.I)
     timestamp_iso = ""
     if m_ts:
@@ -275,56 +271,53 @@ def extract_pdf_metadata(text: str):
         "timestamp_iso": timestamp_iso,
     }
 
-
-
-def extract_section(text, start_marker, end_marker=None):
+def extract_section(text, start_pattern, end_pattern=None):
     text = normalize_pdf_text(text)
 
-    start_match = re.search(re.escape(start_marker), text, flags=re.I)
+    start_match = re.search(start_pattern, text, flags=re.I | re.S)
     if not start_match:
         return ""
 
     start_idx = start_match.start()
 
-    if end_marker:
-        end_match = re.search(re.escape(end_marker), text[start_idx + len(start_marker):], flags=re.I)
+    if end_pattern:
+        end_match = re.search(end_pattern, text[start_idx + 1:], flags=re.I | re.S)
         if end_match:
-            end_idx = start_idx + len(start_marker) + end_match.start()
+            end_idx = start_idx + 1 + end_match.start()
             return text[start_idx:end_idx]
 
     return text[start_idx:]
-
-
 
 def value_in_range(value, low, high):
     if value is None or low is None or high is None:
         return False
     return low <= value <= high
 
-
-
 def iter_clean_lines(section):
-    for raw in section.splitlines():
+    for raw in str(section).splitlines():
         line = " ".join(raw.replace("\u202f", " ").split())
         if line:
             yield line
 
-
-
 def parse_tolerance_line(line):
-    m = re.search(rf"Tolerance:\s*([-+]?\d+\.\d+)\s*{TOL_SEP}\s*([-+]?\d+\.\d+)", line)
-    if not m:
-        return None, None
-    return safe_float(m.group(1)), safe_float(m.group(2))
+    line = normalize_pdf_text(line)
+    m = re.search(rf"Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})", line, re.I)
+    if m:
+        return safe_float(m.group(1)), safe_float(m.group(2))
 
+    # Handles lines like: Reference Tolerance / Center 1.52 1.11 -3.89 ... 4.00
+    nums = re.findall(NUM, line)
+    if ("Tolerance" in line or "Reference Tolerance" in line) and len(nums) >= 2 and ("..." in line or "..." in normalize_pdf_text(line)):
+        return safe_float(nums[-2]), safe_float(nums[-1])
 
+    return None, None
 
 def find_summary_statuses(text):
-    section = extract_section(text, "Summary", "IEC Constancy\nStandard")
+    section = extract_section(text, r"Summary", r"IEC\s+Constancy\s+Standard")
     statuses = {}
     for line in iter_clean_lines(section):
         m = re.search(
-            r"^(Homogeneity \(IEC Constancy\)|Noise \(IEC Constancy\)|MTF \(IEC Constancy\)|Table Positioning \(IEC Constancy\)|Tube Voltage \(IEC Constancy\)|Image Inspection \(Constancy\))\s+.*\s+(OK|NOT OK)$",
+            r"^(Homogeneity\s*\(IEC Constancy\)|Noise\s*\(IEC Constancy\)|MTF\s*\(IEC Constancy\)|Table Positioning\s*\(IEC Constancy\)|Tube Voltage\s*\(IEC Constancy\)|Image Inspection\s*\(Constancy\))\s+.*\s+(OK|NOT OK)$",
             line,
             re.I,
         )
@@ -332,15 +325,14 @@ def find_summary_statuses(text):
             statuses[m.group(1).strip()] = m.group(2).upper().replace("NOT ", "FAIL_")
     return statuses
 
-
 # =========================================================
 # CT PARSERS FOR SIEMENS IEC CONSTANCY LAYOUT
 # =========================================================
 def parse_ct_homogeneity(text):
     section = extract_section(
         text,
-        r"1\s+Homogeneity\s*\(IEC\s*Constancy\)",
-        r"2\s+Noise\s*\(IEC\s*Constancy\)",
+        SECTION_PATTERNS["homogeneity_start"],
+        SECTION_PATTERNS["noise_start"],
     )
 
     values = []
@@ -352,10 +344,10 @@ def parse_ct_homogeneity(text):
             current_low, current_high = low, high
             continue
 
-        # Inline row with its own tolerance: Diff.3 -1.18 0.00 -4.00 … 4.00
         m_inline = re.search(
-            rf"^(Diff\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*{TOL_SEP}\s*([-+]?\d+\.\d+)$",
+            rf"^(Diff\.\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})$",
             line,
+            re.I,
         )
         if m_inline:
             label = m_inline.group(1)
@@ -365,8 +357,7 @@ def parse_ct_homogeneity(text):
             values.append((label, val, low, high))
             continue
 
-        # Inherited tolerance rows: Diff.3 0.10 0.00
-        m_simple = re.search(r"^(Diff\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)$", line)
+        m_simple = re.search(rf"^(Diff\.\d+)\s+({NUM})\s+({NUM})$", line, re.I)
         if m_simple and current_low is not None and current_high is not None:
             label = m_simple.group(1)
             val = safe_float(m_simple.group(2))
@@ -394,13 +385,11 @@ def parse_ct_homogeneity(text):
         "details": f"Worst {worst[0]} = {worst[1]} [{worst[2]},{worst[3]}] across {len(values)} values",
     }
 
-
-
 def parse_ct_noise(text):
     section = extract_section(
         text,
-        "2 Noise (IEC Constancy)",
-        "3 MTF (IEC Constancy)",
+        SECTION_PATTERNS["noise_start"],
+        SECTION_PATTERNS["mtf_start"],
     )
 
     values = []
@@ -408,8 +397,9 @@ def parse_ct_noise(text):
 
     for line in iter_clean_lines(section):
         m = re.search(
-            rf"^(\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*{TOL_SEP}\s*([-+]?\d+\.\d+)\s+(In Tol\.|Out Tol\.)$",
+            rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})(?:\s+(In Tol\.|Out Tol\.))?$",
             line,
+            re.I,
         )
         if not m:
             continue
@@ -419,7 +409,7 @@ def parse_ct_noise(text):
         ref = safe_float(m.group(3))
         low = safe_float(m.group(4))
         high = safe_float(m.group(5))
-        row_status = m.group(6)
+        row_status = m.group(6) or ""
 
         values.append((slice_no, val, ref, low, high))
         if ("Out" in row_status) or (not value_in_range(val, low, high)):
@@ -445,13 +435,11 @@ def parse_ct_noise(text):
         "details": f"Worst slice {worst[0]} noise = {worst[1]} [{worst[3]},{worst[4]}]",
     }
 
-
-
 def parse_ct_mtf(text):
     section = extract_section(
         text,
-        "3 MTF (IEC Constancy)",
-        "4 Table Positioning (IEC Constancy)",
+        SECTION_PATTERNS["mtf_start"],
+        SECTION_PATTERNS["table_start"],
     )
 
     vals50 = []
@@ -461,22 +449,27 @@ def parse_ct_mtf(text):
 
     for line in iter_clean_lines(section):
         m_tol = re.search(
-            rf"Tolerance:\s*([-+]?\d+\.\d+)\s*{TOL_SEP}\s*([-+]?\d+\.\d+)\s+Reference\s+Tolerance:\s*([-+]?\d+\.\d+)\s*{TOL_SEP}\s*([-+]?\d+\.\d+)",
+            rf"Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})\s+Reference\s+Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})",
             line,
+            re.I,
         )
         if m_tol:
             tol50 = (safe_float(m_tol.group(1)), safe_float(m_tol.group(2)))
             tol10 = (safe_float(m_tol.group(3)), safe_float(m_tol.group(4)))
             continue
 
-        # Sharpest mode has different header layout and only one row with no per-slice refs in same pattern.
-        m_sharp_ref_50 = re.search(r"Reference:\s*([-+]?\d+\.\d+)$", line)
-        if m_sharp_ref_50:
-            continue
+        # Some layouts put two tolerance bands in one line without exact same wording
+        if ("Tolerance" in line and "Reference Tolerance" in line) or ("Tolerance" in line and "Reference" in line and "..." in line):
+            nums = [safe_float(x) for x in re.findall(NUM, line)]
+            if len(nums) >= 4:
+                tol50 = (nums[0], nums[1])
+                tol10 = (nums[2], nums[3])
+                continue
 
         m_row = re.search(
-            r"^(\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)$",
+            rf"^(\d+)\s+({NUM})\s+({NUM})\s+({NUM})\s+({NUM})$",
             line,
+            re.I,
         )
         if m_row:
             slice_no = int(m_row.group(1))
@@ -488,8 +481,7 @@ def parse_ct_mtf(text):
             vals10.append((slice_no, val10, ref10, tol10[0], tol10[1]))
             continue
 
-        # Sharpest mode row: 1 12.46 14.65
-        m_sharp_row = re.search(r"^(\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)$", line)
+        m_sharp_row = re.search(rf"^(\d+)\s+({NUM})\s+({NUM})$", line, re.I)
         if m_sharp_row and tol50[0] is not None and tol10[0] is not None:
             slice_no = int(m_sharp_row.group(1))
             val50 = safe_float(m_sharp_row.group(2))
@@ -541,13 +533,11 @@ def parse_ct_mtf(text):
         },
     ]
 
-
-
 def parse_ct_table_positioning(text):
     section = extract_section(
         text,
-        "4 Table Positioning (IEC Constancy)",
-        "5 Tube Voltage (IEC Constancy)",
+        SECTION_PATTERNS["table_start"],
+        SECTION_PATTERNS["tube_start"],
     )
 
     deviations = []
@@ -555,8 +545,9 @@ def parse_ct_table_positioning(text):
 
     for line in iter_clean_lines(section):
         m = re.search(
-            rf"^Position\s+(\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*{TOL_SEP}\s*([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*{TOL_SEP}\s*([-+]?\d+\.\d+)$",
+            rf"^Position\s+(\d+)\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})$",
             line,
+            re.I,
         )
         if not m:
             continue
@@ -596,13 +587,11 @@ def parse_ct_table_positioning(text):
         "details": f"Max absolute indicated position = {max(deviations)}",
     }
 
-
-
 def parse_ct_tube_voltage(text):
     section = extract_section(
         text,
-        "5 Tube Voltage (IEC Constancy)",
-        "6 Image Inspection (Constancy)",
+        SECTION_PATTERNS["tube_start"],
+        SECTION_PATTERNS["image_start"],
     )
 
     deviations = []
@@ -610,8 +599,9 @@ def parse_ct_tube_voltage(text):
 
     for line in iter_clean_lines(section):
         m = re.search(
-            rf"^(\d+)\s+(\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*{TOL_SEP}\s*([-+]?\d+\.\d+)\s+(In Tol\.|Out Tol\.)$",
+            rf"^(\d+)\s+(\d+)\s+({NUM})\s+({NUM})\s*{TOL_SEP}\s*({NUM})(?:\s+(In Tol\.|Out Tol\.))?$",
             line,
+            re.I,
         )
         if not m:
             continue
@@ -621,7 +611,7 @@ def parse_ct_tube_voltage(text):
         measured = safe_float(m.group(3))
         low = safe_float(m.group(4))
         high = safe_float(m.group(5))
-        row_status = m.group(6)
+        row_status = m.group(6) or ""
 
         deviations.append(abs(measured - nominal))
         if ("Out" in row_status) or (not value_in_range(measured, low, high)):
@@ -646,10 +636,8 @@ def parse_ct_tube_voltage(text):
         "details": f"Max deviation {max(deviations):.3f} kV",
     }
 
-
-
 def parse_ct_image_inspection(text):
-    section = extract_section(text, "6 Image Inspection (Constancy)", None)
+    section = extract_section(text, SECTION_PATTERNS["image_start"], None)
     accept = len(re.findall(r"\bAccept\b", section, flags=re.I))
     reject = len(re.findall(r"\bReject\b|\bFail\b", section, flags=re.I))
 
@@ -661,8 +649,6 @@ def parse_ct_image_inspection(text):
         "status": "PASS" if reject == 0 and accept > 0 else "FAIL",
         "details": f"{accept} accepted, {reject} rejected",
     }
-
-
 
 def infer_ct_parsers_from_pdf_text(text):
     results = []
@@ -680,7 +666,6 @@ def infer_ct_parsers_from_pdf_text(text):
     results.append(parse_ct_image_inspection(text))
     return results
 
-
 # =========================================================
 # GITHUB HELPERS
 # =========================================================
@@ -689,8 +674,6 @@ def github_headers(token):
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
     }
-
-
 
 def github_get_file(owner, repo, path, token, branch="main"):
     try:
@@ -708,8 +691,6 @@ def github_get_file(owner, repo, path, token, branch="main"):
         return None, None, None
 
     return None, None, f"GitHub read error {resp.status_code}: {resp.text}"
-
-
 
 def github_put_file(owner, repo, path, token, content_text, message, branch="main", sha=None):
     try:
@@ -731,8 +712,6 @@ def github_put_file(owner, repo, path, token, content_text, message, branch="mai
 
     return False, f"GitHub write error {resp.status_code}: {resp.text}"
 
-
-
 def github_delete_file(owner, repo, path, token, message, branch="main", sha=None):
     try:
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
@@ -749,8 +728,6 @@ def github_delete_file(owner, repo, path, token, message, branch="main", sha=Non
         return True, None
 
     return False, f"GitHub delete error {resp.status_code}: {resp.text}"
-
-
 
 def load_history_from_github(owner, repo, path, token, branch="main"):
     content, sha, err = github_get_file(owner, repo, path, token, branch=branch)
@@ -769,8 +746,6 @@ def load_history_from_github(owner, repo, path, token, branch="main"):
 
     return normalize_history_df(df), sha, None
 
-
-
 def save_history_to_github(df, owner, repo, path, token, branch="main", sha=None):
     csv_text = normalize_history_df(df).to_csv(index=False)
     ok, err = github_put_file(
@@ -784,7 +759,6 @@ def save_history_to_github(df, owner, repo, path, token, branch="main", sha=None
         sha=sha,
     )
     return ok, err
-
 
 # =========================================================
 # LOCKING
@@ -821,8 +795,6 @@ def acquire_local_lock(lock_path=LOCAL_LOCK_FILE, timeout_seconds=20, stale_lock
 
         time.sleep(0.5)
 
-
-
 def release_local_lock(lock_path=LOCAL_LOCK_FILE):
     try:
         if lock_path.exists():
@@ -830,16 +802,12 @@ def release_local_lock(lock_path=LOCAL_LOCK_FILE):
     except Exception:
         pass
 
-
-
 def github_lock_path(csv_path):
     csv_path = csv_path.strip("/")
     if "/" in csv_path:
         parent = csv_path.rsplit("/", 1)[0]
         return f"{parent}/ct_qc_history.lock.json"
     return "ct_qc_history.lock.json"
-
-
 
 def acquire_github_lock(owner, repo, csv_path, token, branch="main", timeout_seconds=25, stale_lock_seconds=300):
     lock_path = github_lock_path(csv_path)
@@ -910,8 +878,6 @@ def acquire_github_lock(owner, repo, csv_path, token, branch="main", timeout_sec
 
         time.sleep(1.0)
 
-
-
 def release_github_lock(owner, repo, csv_path, token, branch="main"):
     lock_path = github_lock_path(csv_path)
     content, sha, err = github_get_file(owner, repo, lock_path, token, branch=branch)
@@ -929,7 +895,6 @@ def release_github_lock(owner, repo, csv_path, token, branch="main"):
         branch=branch,
         sha=sha,
     )
-
 
 # =========================================================
 # HISTORY STORAGE
@@ -959,17 +924,12 @@ def load_history(local_only=True, github_cfg=None):
 
     return normalize_history_df(df), None, None
 
-
 @st.cache_data(ttl=60, show_spinner=False)
 def cached_load_history(local_only=True, github_cfg=None):
     return load_history(local_only=local_only, github_cfg=github_cfg)
 
-
-
 def save_history_local(df):
     normalize_history_df(df).to_csv(LOCAL_HISTORY_CSV, index=False)
-
-
 
 def append_results_to_history(
     results,
@@ -1025,8 +985,6 @@ def append_results_to_history(
         sha=sha,
     )
     return updated, ok, err
-
-
 
 def save_results_with_lock(
     results,
@@ -1097,7 +1055,6 @@ def save_results_with_lock(
             branch=github_cfg["branch"],
         )
 
-
 # =========================================================
 # TREND DATA PREP
 # =========================================================
@@ -1116,7 +1073,6 @@ def build_frontpage_trend_df(history_df, include_current_df=None):
 
     out = trend_df.sort_values(["scanner_id", "test_name", "timestamp_dt"]).reset_index(drop=True)
     return out
-
 
 # =========================================================
 # PDF STYLES / HELPERS
@@ -1227,8 +1183,6 @@ def get_pdf_styles():
 
     return styles
 
-
-
 def add_pdf_header(elements, styles, title, subtitle="", site_name="", scanner_name="", include_logo=True):
     if include_logo and LOGO_PATH.exists():
         try:
@@ -1248,15 +1202,11 @@ def add_pdf_header(elements, styles, title, subtitle="", site_name="", scanner_n
     elements.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#CBD5E1")))
     elements.append(Spacer(1, 8))
 
-
-
 def status_paragraph(status, styles):
     s = str(status).upper().strip()
     if s == "PASS":
         return Paragraph("PASS", styles["PassBadge"])
     return Paragraph("FAIL", styles["FailBadge"])
-
-
 
 def format_value_unit(value, unit):
     if pd.isna(value):
@@ -1268,13 +1218,9 @@ def format_value_unit(value, unit):
         pass
     return f"{value} {unit}".strip()
 
-
-
 def format_session_date(ts):
     ts = str(ts)
     return ts.split("T")[0] if ts else ""
-
-
 
 def build_results_table(results_df, styles):
     df = normalize_history_df(results_df).copy()
@@ -1331,8 +1277,6 @@ def build_results_table(results_df, styles):
     table.setStyle(ts)
     return table
 
-
-
 def fig_to_rl_image(fig, width=500):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=160)
@@ -1341,8 +1285,6 @@ def fig_to_rl_image(fig, width=500):
     iw, ih = img_reader.getSize()
     aspect = ih / float(iw) if iw else 0.58
     return RLImage(buf, width=width, height=width * aspect)
-
-
 
 def add_reference_lines_ct(ax, selected_test):
     if selected_test == "Homogeneity":
@@ -1358,8 +1300,6 @@ def add_reference_lines_ct(ax, selected_test):
         ax.axhline(1.0, linestyle="--", alpha=0.7)
     elif selected_test == "Tube Voltage":
         ax.axhline(0.0, linestyle="--", alpha=0.4)
-
-
 
 def create_trend_chart(df, test_name):
     sub = build_frontpage_trend_df(df)
@@ -1381,8 +1321,6 @@ def create_trend_chart(df, test_name):
     add_reference_lines_ct(ax, test_name)
     fig.autofmt_xdate()
     return fig
-
-
 
 def build_pdf_report(
     results_df,
@@ -1466,8 +1404,6 @@ def build_pdf_report(
 
     doc.build(elements)
     return pdf_path
-
-
 
 def build_session_summary_pdf(history_df, site_name=None, scanner_name=None, scanner_id=None):
     scanner_fragment = sanitize_filename(scanner_name or scanner_id or "scanner")
@@ -1565,8 +1501,6 @@ def build_session_summary_pdf(history_df, site_name=None, scanner_name=None, sca
     doc.build(elements)
     return pdf_path
 
-
-
 def build_single_session_pdf(session_df):
     pdf_path = REPORTS_DIR / f"CT_QC_Selected_Session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
 
@@ -1637,7 +1571,6 @@ def build_single_session_pdf(session_df):
 
     doc.build(elements)
     return pdf_path
-
 
 # =========================================================
 # APP
@@ -1733,6 +1666,23 @@ if uploaded_file:
 
         with st.expander("DEBUG: extracted PDF text"):
             st.text(pdf_text[:12000])
+
+        with st.expander("DEBUG: header search"):
+            for pat in [
+                SECTION_PATTERNS["homogeneity_start"],
+                SECTION_PATTERNS["noise_start"],
+                SECTION_PATTERNS["mtf_start"],
+                SECTION_PATTERNS["table_start"],
+                SECTION_PATTERNS["tube_start"],
+                SECTION_PATTERNS["image_start"],
+            ]:
+                m = re.search(pat, pdf_text, flags=re.I | re.S)
+                st.write(pat, "->", bool(m))
+                if m:
+                    start = max(0, m.start() - 120)
+                    end = min(len(pdf_text), m.end() + 220)
+                    st.code(pdf_text[start:end])
+
         uploaded_file.seek(0)
         uploaded_signature = str(hash(uploaded_file.getvalue()))
         uploaded_file.seek(0)
@@ -1833,31 +1783,30 @@ if uploaded_file:
         with st.expander("DEBUG: section checks"):
             st.write(
                 "Homogeneity section found:",
-                bool(extract_section(pdf_text, "1 Homogeneity (IEC Constancy)", "2 Noise (IEC Constancy)"))
+                bool(extract_section(pdf_text, SECTION_PATTERNS["homogeneity_start"], SECTION_PATTERNS["noise_start"]))
             )
             st.write(
                 "Noise section found:",
-                bool(extract_section(pdf_text, "2 Noise (IEC Constancy)", "3 MTF (IEC Constancy)"))
+                bool(extract_section(pdf_text, SECTION_PATTERNS["noise_start"], SECTION_PATTERNS["mtf_start"]))
             )
             st.write(
                 "MTF section found:",
-                bool(extract_section(pdf_text, "3 MTF (IEC Constancy)", "4 Table Positioning (IEC Constancy)"))
+                bool(extract_section(pdf_text, SECTION_PATTERNS["mtf_start"], SECTION_PATTERNS["table_start"]))
             )
             st.write(
                 "Table Positioning section found:",
-                bool(extract_section(pdf_text, "4 Table Positioning (IEC Constancy)", "5 Tube Voltage (IEC Constancy)"))
+                bool(extract_section(pdf_text, SECTION_PATTERNS["table_start"], SECTION_PATTERNS["tube_start"]))
             )
             st.write(
                 "Tube Voltage section found:",
-                bool(extract_section(pdf_text, "5 Tube Voltage (IEC Constancy)", "6 Image Inspection (Constancy)"))
+                bool(extract_section(pdf_text, SECTION_PATTERNS["tube_start"], SECTION_PATTERNS["image_start"]))
             )
             st.write(
                 "Image Inspection section found:",
-                bool(extract_section(pdf_text, "6 Image Inspection (Constancy)", None))
+                bool(extract_section(pdf_text, SECTION_PATTERNS["image_start"], None))
             )
 
         parsed_results = infer_ct_parsers_from_pdf_text(pdf_text)
-        
 
     for r in parsed_results:
         r["source_file"] = uploaded_file.name
@@ -2094,7 +2043,7 @@ else:
         )
 
     timestamp_options = (
-        history_df.loc[history_df["scanner_id"] == selected_system, "timestamp"]
+        front_trend_df.loc[front_trend_df["scanner_id"] == selected_system, "timestamp"]
         .dropna()
         .astype(str)
         .unique()
@@ -2175,7 +2124,7 @@ else:
         if not selected_system or not selected_timestamp:
             st.error("Please select system and session timestamp.")
         else:
-            session_df = build_single_session_df(history_df, selected_system, selected_timestamp)
+            session_df = build_single_session_df(front_trend_df, selected_system, selected_timestamp)
 
             if session_df.empty:
                 st.warning("No data found for selected session.")
