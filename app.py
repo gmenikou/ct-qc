@@ -339,8 +339,8 @@ def find_summary_statuses(text):
 def parse_ct_homogeneity(text):
     section = extract_section(
         text,
-        "1 Homogeneity (IEC Constancy)",
-        "2 Noise (IEC Constancy)",
+        r"1\s+Homogeneity\s*\(IEC\s*Constancy\)",
+        r"2\s+Noise\s*\(IEC\s*Constancy\)",
     )
 
     values = []
