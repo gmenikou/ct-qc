@@ -382,27 +382,6 @@ def value_in_range(value, low, high):
     return low <= value <= high
 
 
-def parse_tolerance_line(line):
-    line = normalize_pdf_text(line)
-    m = re.search(rf"Tolerance:\s*({NUM})\s*{TOL_SEP}\s*({NUM})", line, re.I)
-    if m:
-        return safe_float(m.group(1)), safe_float(m.group(2))
-
-    cleaned = line.replace(":", ".")
-    nums = [safe_float(x) for x in re.findall(NUM, cleaned)]
-    if (
-        ("Tolerance" in line or "Ref" in line or "..." in line or "–" in line)
-        and len(nums) >= 2
-    ):
-        return nums[-2], nums[-1]
-
-    return None, None
-
-
-def row_status(value, low, high):
-    return "PASS" if value_in_range(value, low, high) else "FAIL"
-
-
 def make_result(
     test_name, sequence_label, value, unit, criteria, status, details
 ):
@@ -429,7 +408,7 @@ def debug_dump_sections(pdf_text, sections_map):
 
 
 # =========================================================
-# ROBUST CT PARSERS FOR ALL SECTIONS
+# ROBUST CT PARSERS FOR ALL SECTIONS (FIXED)
 # =========================================================
 def parse_ct_lightmarker(section):
     results = []
@@ -490,7 +469,12 @@ def parse_ct_slice(section):
     if not section:
         return [make_result("Slice Thickness", "Standard", 0.0, "mm", "Slice thickness within tolerance", "PASS", "Slice thickness passed")]
     
-    nums = [safe_float(x) for x in re.findall(NUM, section) if safe_float(x) is not None]
+    nums = []
+    for x in re.findall(NUM, section):
+        f = safe_float(x)
+        if f is not None:
+            nums.append(f)
+            
     vals = [v for v in nums if 0.0 <= abs(v) <= 10.0]
     val = max(vals, key=abs) if vals else 0.0
 
@@ -514,7 +498,12 @@ def parse_ct_water_value_and_homogeneity(section):
             make_result("Homogeneity", "Standard", 0.0, "HU", "Within tolerance", "PASS", "Homogeneity passed")
         ]
 
-    nums = [safe_float(x) for x in re.findall(NUM, section) if safe_float(x) is not None]
+    nums = []
+    for x in re.findall(NUM, section):
+        f = safe_float(x)
+        if f is not None:
+            nums.append(f)
+            
     water_val = abs(nums[0]) if nums else 0.0
     homog_val = abs(nums[1]) if len(nums) > 1 else 0.0
 
@@ -544,7 +533,12 @@ def parse_ct_noise(section):
     if not section:
         return [make_result("Noise", "Standard", 0.0, "HU", "Noise within tolerance", "PASS", "Noise passed")]
 
-    nums = [safe_float(x) for x in re.findall(NUM, section) if safe_float(x) is not None]
+    nums = []
+    for x in re.findall(NUM, section):
+        f = safe_float(x)
+        if f is not None:
+            nums.append(f)
+            
     val = max(nums) if nums else 0.0
 
     return [
@@ -567,7 +561,12 @@ def parse_ct_mtf(section):
             make_result("MTF 10%", "Standard", 6.5, "lp/cm", "MTF 10% within tolerance", "PASS", "MTF 10% passed")
         ]
 
-    nums = [safe_float(x) for x in re.findall(NUM, section) if safe_float(x) is not None and 1.0 <= abs(x) <= 15.0]
+    nums = []
+    for x in re.findall(NUM, section):
+        f = safe_float(x)
+        if f is not None and 1.0 <= abs(f) <= 15.0:
+            nums.append(f)
+            
     m50 = nums[0] if nums else 4.0
     m10 = nums[1] if len(nums) > 1 else 6.5
 
@@ -581,7 +580,12 @@ def parse_ct_contrast(section):
     if not section:
         return [make_result("Contrast Scale", "Typical body", 0.002, "1/HUcm", "Contrast scale within tolerance", "PASS", "Contrast scale passed")]
 
-    nums = [safe_float(x) for x in re.findall(NUM, section) if safe_float(x) is not None and abs(x) < 0.1]
+    nums = []
+    for x in re.findall(NUM, section):
+        f = safe_float(x)
+        if f is not None and abs(f) < 0.1:
+            nums.append(f)
+            
     val = nums[0] if nums else 0.002
 
     return [
@@ -604,7 +608,12 @@ def parse_ct_table_positioning(section):
             make_result("Table Positioning (Stepwise)", "Stepwise movement", 0.0, "mm", "Within tolerance", "PASS", "Table positioning passed")
         ]
 
-    nums = [safe_float(x) for x in re.findall(NUM, section) if safe_float(x) is not None and abs(x) <= 5.0]
+    nums = []
+    for x in re.findall(NUM, section):
+        f = safe_float(x)
+        if f is not None and abs(f) <= 5.0:
+            nums.append(f)
+            
     dev = max(nums, key=abs) if nums else 0.0
 
     return [
@@ -617,7 +626,12 @@ def parse_ct_tube_voltage(section):
     if not section:
         return [make_result("Tube Voltage", "Constancy", 0.0, "kV", "Tube voltage within tolerance", "PASS", "Tube voltage passed")]
 
-    nums = [safe_float(x) for x in re.findall(NUM, section) if safe_float(x) is not None]
+    nums = []
+    for x in re.findall(NUM, section):
+        f = safe_float(x)
+        if f is not None:
+            nums.append(f)
+            
     dev = abs(nums[-1]) if nums else 0.0
 
     return [
