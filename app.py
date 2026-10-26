@@ -31,11 +31,11 @@ import streamlit as st
 APP_TITLE = "CT IEC Constancy QC Reporter"
 
 # =========================================================
-# GITHUB SECRETS INTEGRATION (ROBUST)
+# GITHUB SECRETS INTEGRATION (SAFE & ROBUST)
 # =========================================================
 sec_github = {}
-if hasattr(st, "secrets"):
-    try:
+try:
+    if hasattr(st, "secrets") and st.secrets:
         if "github" in st.secrets:
             sec_github = st.secrets["github"]
         else:
@@ -46,8 +46,8 @@ if hasattr(st, "secrets"):
                 "branch": st.secrets.get("GITHUB_BRANCH") or st.secrets.get("branch", "main"),
                 "path": st.secrets.get("GITHUB_CSV_PATH") or st.secrets.get("path", "ct_qc_data/ct_qc_history.csv"),
             }
-    except Exception:
-        sec_github = {}
+except Exception:
+    sec_github = {}
 
 DEFAULT_GITHUB_OWNER = sec_github.get("owner", "YOUR_GITHUB_USERNAME")
 DEFAULT_GITHUB_REPO = sec_github.get("repo", "YOUR_REPO_NAME")
