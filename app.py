@@ -86,8 +86,6 @@ SECTION_PATTERNS = {
     "image_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Image\s+Inspection",
 }
 
-TOP_LEVEL_SECTION_RE = re.compile(r"(?mi)^\d+(\.\d+)*\s+.+$")
-
 DEBUG_MODE = True
 
 
@@ -309,7 +307,9 @@ def extract_pdf_metadata(text: str):
     )
     if m_head_product:
         scanner_name = m_head_product.group(1).strip()
-        serial_number = m_head_product.group(2).strip()
+        cand_serial = m_head_product.group(2).strip()
+        if "component" not in cand_serial.lower():
+            serial_number = cand_serial
         if m_head_product.group(3):
             candidate = m_head_product.group(3).strip()
             if candidate and "page" not in candidate.lower():
@@ -319,9 +319,11 @@ def extract_pdf_metadata(text: str):
     if m_prod and m_prod.group(1).strip():
         scanner_name = " ".join(m_prod.group(1).split())
 
-    m_serial = re.search(r"^Serial Number\s+(.+?)\s*$", raw, re.I | re.M)
-    if m_serial and m_serial.group(1).strip():
-        serial_number = " ".join(m_serial.group(1).split())
+    m_serial = re.search(r"^Serial Number\s+([A-Za-z0-9\-]+)", raw, re.I | re.M)
+    if m_serial:
+        cand_serial = m_serial.group(1).strip()
+        if "component" not in cand_serial.lower():
+            serial_number = cand_serial
 
     m_hosp = re.search(r"^Hospital Name\s+(.+?)\s*$", raw, re.I | re.M)
     if m_hosp and m_hosp.group(1).strip():
@@ -344,7 +346,9 @@ def extract_pdf_metadata(text: str):
         if m_footer:
             site_name = m_footer.group(1).strip()
             scanner_name = scanner_name or m_footer.group(2).strip()
-            serial_number = serial_number or m_footer.group(3).strip()
+            cand_serial = m_footer.group(3).strip()
+            if "component" not in cand_serial.lower():
+                serial_number = serial_number or cand_serial
 
     m_ts = re.search(
         r"(\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)", clean, re.I
@@ -365,25 +369,25 @@ def extract_pdf_metadata(text: str):
     }
 
 
-def extract_section_by_title(text: str, title_regex: str) -> str:
+def get_section_texts(text):
     text = normalize_pdf_text(text)
-    start_match = re.search(title_regex, text, flags=re.I | re.M)
-    if not start_match:
-        return ""
+    found = []
+    for key, pattern in SECTION_PATTERNS.items():
+        for m in re.finditer(pattern, text, flags=re.I | re.M):
+            found.append((m.start(), key))
 
-    start_idx = start_match.start()
-    later_text = text[start_match.end() :]
-    next_matches = list(TOP_LEVEL_SECTION_RE.finditer(later_text))
+    # Sort occurrences by their position in the text
+    found.sort(key=lambda x: x[0])
 
-    if next_matches:
-        end_idx = start_match.end() + next_matches[0].start()
-        return text[start_idx:end_idx]
-
-    return text[start_idx:]
-
-
-def scan_top_level_sections(text: str):
-    return re.findall(r"(?mi)^\d+(\.\d+)*\s+.+$", normalize_pdf_text(text))
+    sections = {}
+    for idx, (start, key) in enumerate(found):
+        next_start = found[idx + 1][0] if idx + 1 < len(found) else len(text)
+        # If multiple matches exist for the same section, accumulate or keep the first/longest
+        if key not in sections:
+            sections[key] = text[start:next_start]
+        else:
+            sections[key] += "\n" + text[start:next_start]
+    return sections
 
 
 def iter_clean_lines(section):
@@ -453,46 +457,21 @@ def make_result(
     }
 
 
-def debug_dump_sections(pdf_text):
+def debug_dump_sections(pdf_text, sections_map):
     if not DEBUG_MODE:
         return
 
-    sections = {
-        "LIGHTMARKER": SECTION_PATTERNS["lightmarker_start"],
-        "SAG_COR": SECTION_PATTERNS["sag_cor_lightmarker_start"],
-        "TOPOGRAM": SECTION_PATTERNS["topogram_start"],
-        "SLICE": SECTION_PATTERNS["slice_start"],
-        "HOMOGENEITY": SECTION_PATTERNS["homogeneity_start"],
-        "NOISE": SECTION_PATTERNS["noise_start"],
-        "MTF": SECTION_PATTERNS["mtf_start"],
-        "CONTRAST": SECTION_PATTERNS["contrast_start"],
-        "TABLE": SECTION_PATTERNS["table_start"],
-        "TUBE": SECTION_PATTERNS["tube_start"],
-        "IMAGE": SECTION_PATTERNS["image_start"],
-    }
-
     with st.expander("DEBUG: section match dump"):
-        st.write("Top-level sections found:")
-        st.write(scan_top_level_sections(pdf_text))
-
-        for name, pattern in sections.items():
-            matches = list(re.finditer(pattern, pdf_text, flags=re.I | re.M))
-            st.write(f"### {name}")
-            st.write(f"Matches found: {len(matches)}")
-            for i, m in enumerate(matches):
-                start = max(0, m.start() - 80)
-                end = min(len(pdf_text), m.end() + 200)
-                snippet = pdf_text[start:end]
-                st.code(f"[Match {i}]\n{snippet}")
+        st.write("Sections successfully detected & sliced:")
+        st.write(list(sections_map.keys()))
+        for name, content in sections_map.items():
+            st.code(f"### {name} ({len(content)} chars)\n{content[:300]}...")
 
 
 # =========================================================
 # CT PARSERS (ROBUST MULTI-LINE SUPPORT)
 # =========================================================
-def parse_ct_lightmarker(text):
-    section = extract_section_by_title(
-        text, SECTION_PATTERNS["lightmarker_start"]
-    )
+def parse_ct_lightmarker(section):
     results = []
     for line in iter_clean_lines(section):
         m = re.search(rf"^(.+?)\s+({NUM})\s+(OK|Pass|In Tol\.)$", line, re.I)
@@ -518,10 +497,7 @@ def parse_ct_lightmarker(text):
     return results
 
 
-def parse_ct_sag_cor_lightmarker(text):
-    section = extract_section_by_title(
-        text, SECTION_PATTERNS["sag_cor_lightmarker_start"]
-    )
+def parse_ct_sag_cor_lightmarker(section):
     results = []
     for line in iter_clean_lines(section):
         m = re.search(
@@ -561,8 +537,7 @@ def parse_ct_sag_cor_lightmarker(text):
     return results
 
 
-def parse_ct_topogram_positioning(text):
-    section = extract_section_by_title(text, SECTION_PATTERNS["topogram_start"])
+def parse_ct_topogram_positioning(section):
     results = []
     for line in iter_clean_lines(section):
         m = re.search(rf"^(.+?)\s+({NUM})\s+(OK|Pass|In Tol\.)$", line, re.I)
@@ -588,8 +563,7 @@ def parse_ct_topogram_positioning(text):
     return results
 
 
-def parse_ct_slice(text):
-    section = extract_section_by_title(text, SECTION_PATTERNS["slice_start"])
+def parse_ct_slice(section):
     if not section:
         return []
     results = []
@@ -636,10 +610,7 @@ def parse_ct_slice(text):
     return results
 
 
-def parse_ct_water_value_and_homogeneity(text):
-    section = extract_section_by_title(
-        text, SECTION_PATTERNS["homogeneity_start"]
-    )
+def parse_ct_water_value_and_homogeneity(section):
     if not section:
         return []
 
@@ -740,8 +711,7 @@ def parse_ct_water_value_and_homogeneity(text):
     return results
 
 
-def parse_ct_noise(text):
-    section = extract_section_by_title(text, SECTION_PATTERNS["noise_start"])
+def parse_ct_noise(section):
     if not section:
         return []
 
@@ -791,8 +761,7 @@ def parse_ct_noise(text):
     ]
 
 
-def parse_ct_mtf(text):
-    section = extract_section_by_title(text, SECTION_PATTERNS["mtf_start"])
+def parse_ct_mtf(section):
     if not section:
         return []
 
@@ -833,8 +802,7 @@ def parse_ct_mtf(text):
     return results
 
 
-def parse_ct_contrast(text):
-    section = extract_section_by_title(text, SECTION_PATTERNS["contrast_start"])
+def parse_ct_contrast(section):
     if not section:
         return []
     lines = list(iter_clean_lines(section))
@@ -870,8 +838,7 @@ def parse_ct_contrast(text):
     return []
 
 
-def parse_ct_table_positioning(text):
-    section = extract_section_by_title(text, SECTION_PATTERNS["table_start"])
+def parse_ct_table_positioning(section):
     if not section:
         return []
     nominal_map = {1: -300.0, 2: 0.0, 3: 300.0, 4: 0.0}
@@ -912,8 +879,7 @@ def parse_ct_table_positioning(text):
     return results
 
 
-def parse_ct_tube_voltage(text):
-    section = extract_section_by_title(text, SECTION_PATTERNS["tube_start"])
+def parse_ct_tube_voltage(section):
     if not section:
         return []
     rows = []
@@ -943,8 +909,7 @@ def parse_ct_tube_voltage(text):
     ]
 
 
-def parse_ct_image_inspection(text):
-    section = extract_section_by_title(text, SECTION_PATTERNS["image_start"])
+def parse_ct_image_inspection(section):
     if not section:
         return []
     status = "PASS"
@@ -972,21 +937,22 @@ def parse_ct_image_inspection(text):
 def parse_ct_pdf(uploaded_file):
     text = read_pdf_text(uploaded_file)
     meta = extract_pdf_metadata(text)
+    sections_map = get_section_texts(text)
 
     results = []
-    results.extend(parse_ct_lightmarker(text))
-    results.extend(parse_ct_sag_cor_lightmarker(text))
-    results.extend(parse_ct_topogram_positioning(text))
-    results.extend(parse_ct_slice(text))
-    results.extend(parse_ct_water_value_and_homogeneity(text))
-    results.extend(parse_ct_noise(text))
-    results.extend(parse_ct_mtf(text))
-    results.extend(parse_ct_contrast(text))
-    results.extend(parse_ct_table_positioning(text))
-    results.extend(parse_ct_tube_voltage(text))
-    results.extend(parse_ct_image_inspection(text))
+    results.extend(parse_ct_lightmarker(sections_map.get("lightmarker_start", "")))
+    results.extend(parse_ct_sag_cor_lightmarker(sections_map.get("sag_cor_lightmarker_start", "")))
+    results.extend(parse_ct_topogram_positioning(sections_map.get("topogram_start", "")))
+    results.extend(parse_ct_slice(sections_map.get("slice_start", "")))
+    results.extend(parse_ct_water_value_and_homogeneity(sections_map.get("homogeneity_start", "")))
+    results.extend(parse_ct_noise(sections_map.get("noise_start", "")))
+    results.extend(parse_ct_mtf(sections_map.get("mtf_start", "")))
+    results.extend(parse_ct_contrast(sections_map.get("contrast_start", "")))
+    results.extend(parse_ct_table_positioning(sections_map.get("table_start", "")))
+    results.extend(parse_ct_tube_voltage(sections_map.get("tube_start", "")))
+    results.extend(parse_ct_image_inspection(sections_map.get("image_start", "")))
 
-    return meta, results, text
+    return meta, results, text, sections_map
 
 
 # =========================================================
@@ -1309,7 +1275,7 @@ def main():
         )
 
         if uploaded_file is not None:
-            meta, results, pdf_text = parse_ct_pdf(uploaded_file)
+            meta, results, pdf_text, sections_map = parse_ct_pdf(uploaded_file)
 
             final_site = (
                 site_input.strip() or meta["site_name"] or "Unknown Site"
@@ -1385,7 +1351,7 @@ def main():
                 st.warning("No QC results extracted from PDF.")
 
             if DEBUG_MODE:
-                debug_dump_sections(pdf_text)
+                debug_dump_sections(pdf_text, sections_map)
 
     with tab_dashboard:
         st.subheader("QC Dashboard & Trends")
