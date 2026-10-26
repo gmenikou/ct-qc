@@ -41,16 +41,16 @@ try:
         else:
             sec_github = {
                 "token": st.secrets.get("GITHUB_TOKEN") or st.secrets.get("token", ""),
-                "owner": st.secrets.get("GITHUB_OWNER") or st.secrets.get("owner", "YOUR_GITHUB_USERNAME"),
-                "repo": st.secrets.get("GITHUB_REPO") or st.secrets.get("repo", "YOUR_REPO_NAME"),
+                "owner": st.secrets.get("GITHUB_OWNER") or st.secrets.get("owner", ""),
+                "repo": st.secrets.get("GITHUB_REPO") or st.secrets.get("repo", ""),
                 "branch": st.secrets.get("GITHUB_BRANCH") or st.secrets.get("branch", "main"),
                 "path": st.secrets.get("GITHUB_CSV_PATH") or st.secrets.get("path", "ct_qc_data/ct_qc_history.csv"),
             }
 except Exception:
     sec_github = {}
 
-DEFAULT_GITHUB_OWNER = sec_github.get("owner", "YOUR_GITHUB_USERNAME")
-DEFAULT_GITHUB_REPO = sec_github.get("repo", "YOUR_REPO_NAME")
+DEFAULT_GITHUB_OWNER = sec_github.get("owner", "")
+DEFAULT_GITHUB_REPO = sec_github.get("repo", "")
 DEFAULT_GITHUB_BRANCH = sec_github.get("branch", "main")
 DEFAULT_GITHUB_CSV_PATH = sec_github.get("path", "ct_qc_data/ct_qc_history.csv")
 DEFAULT_GITHUB_TOKEN = sec_github.get("token", "")
@@ -76,14 +76,14 @@ SECTION_PATTERNS = {
     "lightmarker_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Lightmarker",
     "sag_cor_lightmarker_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Sagittal/Coronal\s+Lightmarker",
     "topogram_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Topogram\s+Positioning",
-    "slice_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Slice\s+Thickness",
-    "homogeneity_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Homogeneity",
+    "slice_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?(?:Slice\s+Thickness|Slice)",
+    "homogeneity_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?(?:Homogeneity|Water\s+Value|CT\s+Number)",
     "noise_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Noise",
     "mtf_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?MTF",
     "contrast_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Contrast",
-    "table_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Table\s+Positioning",
-    "tube_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Tube\s+Voltage",
-    "image_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Image\s+Inspection",
+    "table_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Table\s+Positioning|Table",
+    "tube_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Tube\s+Voltage|Voltage",
+    "image_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?(?:Image\s+Inspection|Inspection|Visual)",
 }
 
 DEBUG_MODE = True
@@ -128,12 +128,6 @@ def normalize_ws(text: str) -> str:
         " ".join(line.replace("\u202f", " ").split())
         for line in str(text).splitlines()
     )
-
-
-def compact_mode_name(name: str) -> str:
-    name = " ".join(str(name).split())
-    name = re.sub(r"\s+\|\s+Serial Number:.*$", "", name, flags=re.I)
-    return name.strip()
 
 
 def format_num(v, digits=3):
@@ -216,8 +210,6 @@ def github_is_ready(cfg):
         and cfg.get("owner")
         and cfg.get("repo")
         and cfg.get("path")
-        and cfg["owner"] != "YOUR_GITHUB_USERNAME"
-        and cfg["repo"] != "YOUR_REPO_NAME"
     )
 
 
@@ -300,6 +292,26 @@ def extract_pdf_metadata(text: str):
     scanner_name = ""
     serial_number = ""
 
+    # Look for Hospital / Site name lines in header
+    m_hosp = re.search(
+        r"^(?:Hospital Name|Customer Name|Site)\s*[:]?\s*(.+?)\s*$",
+        raw,
+        re.I | re.M,
+    )
+    if m_hosp:
+        site_name = m_hosp.group(1).strip()
+
+    if not site_name:
+        # Check top lines for hospital/facility names
+        lines = [line.strip() for line in clean.splitlines() if line.strip()]
+        for line in lines[:5]:
+            if any(
+                kw in line.lower()
+                for kw in ["hospital", "clinic", "medical", "center", "general"]
+            ):
+                site_name = line
+                break
+
     m_head_product = re.search(
         r"^(.*?)\nIEC Constancy\nSerial Number:\s*([A-Za-z0-9-]+)(?:\n(.+))?$",
         clean,
@@ -310,7 +322,7 @@ def extract_pdf_metadata(text: str):
         cand_serial = m_head_product.group(2).strip()
         if "component" not in cand_serial.lower():
             serial_number = cand_serial
-        if m_head_product.group(3):
+        if m_head_product.group(3) and not site_name:
             candidate = m_head_product.group(3).strip()
             if candidate and "page" not in candidate.lower():
                 site_name = candidate
@@ -324,18 +336,6 @@ def extract_pdf_metadata(text: str):
         cand_serial = m_serial.group(1).strip()
         if "component" not in cand_serial.lower():
             serial_number = cand_serial
-
-    m_hosp = re.search(r"^Hospital Name\s+(.+?)\s*$", raw, re.I | re.M)
-    if m_hosp and m_hosp.group(1).strip():
-        site_name = " ".join(m_hosp.group(1).split())
-
-    m_customer = re.search(
-        r"Customer\s+Name\s+(.+?)\s+Product\s+Name", clean, re.I | re.S
-    )
-    if not site_name and m_customer:
-        candidate = " ".join(m_customer.group(1).split())
-        if candidate and candidate.lower() not in {"-", "na"}:
-            site_name = candidate
 
     if not site_name:
         m_footer = re.search(
@@ -376,13 +376,11 @@ def get_section_texts(text):
         for m in re.finditer(pattern, text, flags=re.I | re.M):
             found.append((m.start(), key))
 
-    # Sort occurrences by their position in the text
     found.sort(key=lambda x: x[0])
 
     sections = {}
     for idx, (start, key) in enumerate(found):
         next_start = found[idx + 1][0] if idx + 1 < len(found) else len(text)
-        # If multiple matches exist for the same section, accumulate or keep the first/longest
         if key not in sections:
             sections[key] = text[start:next_start]
         else:
@@ -469,7 +467,7 @@ def debug_dump_sections(pdf_text, sections_map):
 
 
 # =========================================================
-# CT PARSERS (ROBUST MULTI-LINE SUPPORT)
+# CT PARSERS
 # =========================================================
 def parse_ct_lightmarker(section):
     results = []
@@ -580,7 +578,11 @@ def parse_ct_slice(section):
                 cand = lines[j]
                 if safe_float(cand) is not None and val is None:
                     val = safe_float(cand)
-                if "in tol" in cand.lower() or "ok" in cand.lower() or "pass" in cand.lower():
+                if (
+                    "in tol" in cand.lower()
+                    or "ok" in cand.lower()
+                    or "pass" in cand.lower()
+                ):
                     status = "PASS"
                 elif "out tol" in cand.lower() or "fail" in cand.lower():
                     status = "FAIL"
@@ -645,18 +647,45 @@ def parse_ct_water_value_and_homogeneity(section):
             val = safe_float(lines[i + 1]) if i + 1 < len(lines) else None
             ref = safe_float(lines[i + 2]) if i + 2 < len(lines) else None
             if val is not None:
-                status = row_status(val, current_low or -6.0, current_high or 6.0)
-                water_rows.append({"slice": slice_no, "value": val, "reference": ref, "low": current_low or -6.0, "high": current_high or 6.0, "status": status})
+                status = row_status(
+                    val, current_low or -6.0, current_high or 6.0
+                )
+                water_rows.append(
+                    {
+                        "slice": slice_no,
+                        "value": val,
+                        "reference": ref,
+                        "low": current_low or -6.0,
+                        "high": current_high or 6.0,
+                        "status": status,
+                    }
+                )
             i += 3
             continue
 
-        if current_slice is not None and line in {"Center", "Diff.3", "Diff.6", "Diff.9", "Diff.12"}:
+        if current_slice is not None and line in {
+            "Center",
+            "Diff.3",
+            "Diff.6",
+            "Diff.9",
+            "Diff.12",
+        }:
             pos_name = line
             val = safe_float(lines[i + 1]) if i + 1 < len(lines) else None
             ref = safe_float(lines[i + 2]) if i + 2 < len(lines) else None
             if val is not None and pos_name != "Center":
                 status = row_status(val, current_low, current_high)
-                diff_rows.append({"slice": current_slice, "position": pos_name, "value": val, "reference": ref, "low": current_low, "high": current_high, "status": status})
+                diff_rows.append(
+                    {
+                        "slice": current_slice,
+                        "position": pos_name,
+                        "value": val,
+                        "reference": ref,
+                        "low": current_low,
+                        "high": current_high,
+                        "status": status,
+                    }
+                )
             i += 3
             continue
 
@@ -732,15 +761,22 @@ def parse_ct_noise(section):
                     break
             if val is not None and low is not None and high is not None:
                 status = row_status(val, low, high)
-                rows.append({"slice": slice_no, "value": val, "reference": ref, "low": low, "high": high, "status": status})
+                rows.append(
+                    {
+                        "slice": slice_no,
+                        "value": val,
+                        "reference": ref,
+                        "low": low,
+                        "high": high,
+                        "status": status,
+                    }
+                )
         i += 1
 
     if not rows:
         return []
 
-    worst, overall_status = summarize_slice_rows(
-        rows, "Noise", worst_by="max"
-    )
+    worst, overall_status = summarize_slice_rows(rows, "Noise", worst_by="max")
     slice_summary = "; ".join(
         f"S{r['slice']}={format_num(r['value'])} HU [{format_num(r['low'], 2)},{format_num(r['high'], 2)}] {r['status']}"
         for r in rows
@@ -785,19 +821,61 @@ def parse_ct_mtf(section):
                 if sf is not None:
                     vals.append(sf)
             if len(vals) >= 2:
-                rows50.append({"slice": slice_no, "value": vals[0], "reference": vals[1], "low": tol50[0], "high": tol50[1], "status": row_status(vals[0], tol50[0], tol50[1])})
+                rows50.append(
+                    {
+                        "slice": slice_no,
+                        "value": vals[0],
+                        "reference": vals[1],
+                        "low": tol50[0],
+                        "high": tol50[1],
+                        "status": row_status(vals[0], tol50[0], tol50[1]),
+                    }
+                )
             if len(vals) >= 4:
-                rows10.append({"slice": slice_no, "value": vals[2], "reference": vals[3], "low": tol10[0], "high": tol10[1], "status": row_status(vals[2], tol10[0], tol10[1])})
+                rows10.append(
+                    {
+                        "slice": slice_no,
+                        "value": vals[2],
+                        "reference": vals[3],
+                        "low": tol10[0],
+                        "high": tol10[1],
+                        "status": row_status(vals[2], tol10[0], tol10[1]),
+                    }
+                )
         i += 1
 
     results = []
     if rows50:
-        worst50, status50 = summarize_slice_rows(rows50, "MTF 50%", worst_by="min")
-        results.append(make_result("MTF 50%", "Standard", worst50["value"], "lp/cm", "All slices within MTF 50% tolerance", status50, f"Worst slice {worst50['slice']} MTF 50% = {format_num(worst50['value'])} lp/cm"))
+        worst50, status50 = summarize_slice_rows(
+            rows50, "MTF 50%", worst_by="min"
+        )
+        results.append(
+            make_result(
+                "MTF 50%",
+                "Standard",
+                worst50["value"],
+                "lp/cm",
+                "All slices within MTF 50% tolerance",
+                status50,
+                f"Worst slice {worst50['slice']} MTF 50% = {format_num(worst50['value'])} lp/cm",
+            )
+        )
 
     if rows10:
-        worst10, status10 = summarize_slice_rows(rows10, "MTF 10%", worst_by="min")
-        results.append(make_result("MTF 10%", "Standard", worst10["value"], "lp/cm", "All slices within MTF 10% tolerance", status10, f"Worst slice {worst10['slice']} MTF 10% = {format_num(worst10['value'])} lp/cm"))
+        worst10, status10 = summarize_slice_rows(
+            rows10, "MTF 10%", worst_by="min"
+        )
+        results.append(
+            make_result(
+                "MTF 10%",
+                "Standard",
+                worst10["value"],
+                "lp/cm",
+                "All slices within MTF 10% tolerance",
+                status10,
+                f"Worst slice {worst10['slice']} MTF 10% = {format_num(worst10['value'])} lp/cm",
+            )
+        )
 
     return results
 
@@ -819,7 +897,13 @@ def parse_ct_contrast(section):
                     vals.append(sf)
             if vals:
                 contrast_scale = vals[-1]
-                rows.append({"slice": slice_no, "contrast_scale": contrast_scale, "status": "PASS"})
+                rows.append(
+                    {
+                        "slice": slice_no,
+                        "contrast_scale": contrast_scale,
+                        "status": "PASS",
+                    }
+                )
         i += 1
 
     if rows:
@@ -863,18 +947,54 @@ def parse_ct_table_positioning(section):
                     step_meas = floats[1] if len(floats) > 1 else cont_meas
                     dev_c = cont_meas - nominal
                     dev_s = step_meas - nominal
-                    cont_rows.append({"position": pos, "nominal": nominal, "measured": cont_meas, "deviation": dev_c, "status": "PASS"})
-                    step_rows.append({"position": pos, "nominal": nominal, "measured": step_meas, "deviation": dev_s, "status": "PASS"})
+                    cont_rows.append(
+                        {
+                            "position": pos,
+                            "nominal": nominal,
+                            "measured": cont_meas,
+                            "deviation": dev_c,
+                            "status": "PASS",
+                        }
+                    )
+                    step_rows.append(
+                        {
+                            "position": pos,
+                            "nominal": nominal,
+                            "measured": step_meas,
+                            "deviation": dev_s,
+                            "status": "PASS",
+                        }
+                    )
         i += 1
 
     results = []
     if cont_rows:
         worst = max(cont_rows, key=lambda x: abs(x["deviation"]))
-        results.append(make_result("Table Positioning (Continuous)", "Continuous movement", abs(worst["deviation"]), "mm", "At each of 4 positions within tolerance", "PASS", f"Worst position P{worst['position']} deviation = {format_num(worst['deviation'])} mm"))
+        results.append(
+            make_result(
+                "Table Positioning (Continuous)",
+                "Continuous movement",
+                abs(worst["deviation"]),
+                "mm",
+                "At each of 4 positions within tolerance",
+                "PASS",
+                f"Worst position P{worst['position']} deviation = {format_num(worst['deviation'])} mm",
+            )
+        )
 
     if step_rows:
         worst = max(step_rows, key=lambda x: abs(x["deviation"]))
-        results.append(make_result("Table Positioning (Stepwise)", "Stepwise movement", abs(worst["deviation"]), "mm", "At each of 4 positions within tolerance", "PASS", f"Worst position P{worst['position']} deviation = {format_num(worst['deviation'])} mm"))
+        results.append(
+            make_result(
+                "Table Positioning (Stepwise)",
+                "Stepwise movement",
+                abs(worst["deviation"]),
+                "mm",
+                "At each of 4 positions within tolerance",
+                "PASS",
+                f"Worst position P{worst['position']} deviation = {format_num(worst['deviation'])} mm",
+            )
+        )
 
     return results
 
@@ -890,7 +1010,14 @@ def parse_ct_tube_voltage(section):
             reference = safe_float(m.group(1))
             if measured and reference:
                 dev = measured - reference
-                rows.append({"measured": measured, "reference": reference, "deviation": dev, "status": "PASS"})
+                rows.append(
+                    {
+                        "measured": measured,
+                        "reference": reference,
+                        "deviation": dev,
+                        "status": "PASS",
+                    }
+                )
 
     if not rows:
         return []
@@ -940,17 +1067,33 @@ def parse_ct_pdf(uploaded_file):
     sections_map = get_section_texts(text)
 
     results = []
-    results.extend(parse_ct_lightmarker(sections_map.get("lightmarker_start", "")))
-    results.extend(parse_ct_sag_cor_lightmarker(sections_map.get("sag_cor_lightmarker_start", "")))
-    results.extend(parse_ct_topogram_positioning(sections_map.get("topogram_start", "")))
+    results.extend(
+        parse_ct_lightmarker(sections_map.get("lightmarker_start", ""))
+    )
+    results.extend(
+        parse_ct_sag_cor_lightmarker(
+            sections_map.get("sag_cor_lightmarker_start", "")
+        )
+    )
+    results.extend(
+        parse_ct_topogram_positioning(sections_map.get("topogram_start", ""))
+    )
     results.extend(parse_ct_slice(sections_map.get("slice_start", "")))
-    results.extend(parse_ct_water_value_and_homogeneity(sections_map.get("homogeneity_start", "")))
+    results.extend(
+        parse_ct_water_value_and_homogeneity(
+            sections_map.get("homogeneity_start", "")
+        )
+    )
     results.extend(parse_ct_noise(sections_map.get("noise_start", "")))
     results.extend(parse_ct_mtf(sections_map.get("mtf_start", "")))
     results.extend(parse_ct_contrast(sections_map.get("contrast_start", "")))
-    results.extend(parse_ct_table_positioning(sections_map.get("table_start", "")))
+    results.extend(
+        parse_ct_table_positioning(sections_map.get("table_start", ""))
+    )
     results.extend(parse_ct_tube_voltage(sections_map.get("tube_start", "")))
-    results.extend(parse_ct_image_inspection(sections_map.get("image_start", "")))
+    results.extend(
+        parse_ct_image_inspection(sections_map.get("image_start", ""))
+    )
 
     return meta, results, text, sections_map
 
@@ -1196,8 +1339,8 @@ def main():
 
         secrets_ready = bool(
             DEFAULT_GITHUB_TOKEN
-            and DEFAULT_GITHUB_OWNER != "YOUR_GITHUB_USERNAME"
-            and DEFAULT_GITHUB_REPO != "YOUR_REPO_NAME"
+            and DEFAULT_GITHUB_OWNER
+            and DEFAULT_GITHUB_REPO
         )
 
         if secrets_ready:
@@ -1219,11 +1362,31 @@ def main():
                     "CSV Path in Repo", value=DEFAULT_GITHUB_CSV_PATH
                 )
             cfg = {
-                "token": github_token if 'github_token' in locals() else DEFAULT_GITHUB_TOKEN,
-                "owner": github_owner if 'github_owner' in locals() else DEFAULT_GITHUB_OWNER,
-                "repo": github_repo if 'github_repo' in locals() else DEFAULT_GITHUB_REPO,
-                "branch": github_branch if 'github_branch' in locals() else DEFAULT_GITHUB_BRANCH,
-                "path": github_path if 'github_path' in locals() else DEFAULT_GITHUB_CSV_PATH,
+                "token": (
+                    github_token
+                    if "github_token" in locals()
+                    else DEFAULT_GITHUB_TOKEN
+                ),
+                "owner": (
+                    github_owner
+                    if "github_owner" in locals()
+                    else DEFAULT_GITHUB_OWNER
+                ),
+                "repo": (
+                    github_repo
+                    if "github_repo" in locals()
+                    else DEFAULT_GITHUB_REPO
+                ),
+                "branch": (
+                    github_branch
+                    if "github_branch" in locals()
+                    else DEFAULT_GITHUB_BRANCH
+                ),
+                "path": (
+                    github_path
+                    if "github_path" in locals()
+                    else DEFAULT_GITHUB_CSV_PATH
+                ),
             }
         else:
             st.warning("Secrets not detected. Enter configuration:")
