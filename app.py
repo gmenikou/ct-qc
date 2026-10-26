@@ -31,9 +31,23 @@ import streamlit as st
 APP_TITLE = "CT IEC Constancy QC Reporter"
 
 # =========================================================
-# GITHUB SECRETS INTEGRATION
+# GITHUB SECRETS INTEGRATION (ROBUST)
 # =========================================================
-sec_github = st.secrets.get("github", {}) if hasattr(st, "secrets") else {}
+sec_github = {}
+if hasattr(st, "secrets"):
+    try:
+        if "github" in st.secrets:
+            sec_github = st.secrets["github"]
+        else:
+            sec_github = {
+                "token": st.secrets.get("GITHUB_TOKEN") or st.secrets.get("token", ""),
+                "owner": st.secrets.get("GITHUB_OWNER") or st.secrets.get("owner", "YOUR_GITHUB_USERNAME"),
+                "repo": st.secrets.get("GITHUB_REPO") or st.secrets.get("repo", "YOUR_REPO_NAME"),
+                "branch": st.secrets.get("GITHUB_BRANCH") or st.secrets.get("branch", "main"),
+                "path": st.secrets.get("GITHUB_CSV_PATH") or st.secrets.get("path", "ct_qc_data/ct_qc_history.csv"),
+            }
+    except Exception:
+        sec_github = {}
 
 DEFAULT_GITHUB_OWNER = sec_github.get("owner", "YOUR_GITHUB_USERNAME")
 DEFAULT_GITHUB_REPO = sec_github.get("repo", "YOUR_REPO_NAME")
@@ -59,26 +73,20 @@ NUM = r"[-+]?(?:\d+(?:[.,]\d+)?|\.\d+)"
 TOL_SEP = r"(?:…|\.\.\.|\u2026|\u202f…\u202f|\s+…\s+|\s+\.\.\.\s+)"
 
 SECTION_PATTERNS = {
-    "lightmarker_start": r"(?mi)^\d+\s+Lightmarker\s*\(IEC\s*Constancy\)\s*$",
-    "sag_cor_lightmarker_start": r"(?mi)^\d+\s+Sagittal/Coronal\s+Lightmarker\s*\(IEC\s*Constancy\)\s*$",
-    "topogram_start": r"(?mi)^\d+\s+Topogram\s+Positioning\s*\(IEC\s*Constancy\)\s*$",
-    "slice_start": r"(?mi)^\d+\s+Slice\s*\(IEC\s*Constancy\)\s*$",
-    "homogeneity_start": r"(?mi)^\d+\s+Homogeneity\s*\(IEC\s*Constancy\)\s*$",
-    "noise_start": r"(?mi)^\d+\s+Noise\s*\(IEC\s*Constancy\)\s*$",
-    "mtf_start": r"(?mi)^\d+\s+MTF\s*\(IEC\s*Constancy\)\s*$",
-    "contrast_start": r"(?mi)^\d+\s+Contrast\s*\(IEC\s*Constancy\)\s*$",
-    "table_start": r"(?mi)^\d+\s+Table\s+Positioning\s*\(IEC\s*Constancy\)\s*$",
-    "tube_start": r"(?mi)^\d+\s+Tube\s+Voltage\s*\(IEC\s*Constancy\)\s*$",
-    "image_start": r"(?mi)^\d+\s+Image\s+Inspection\s*\(Constancy\)\s*$",
+    "lightmarker_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Lightmarker",
+    "sag_cor_lightmarker_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Sagittal/Coronal\s+Lightmarker",
+    "topogram_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Topogram\s+Positioning",
+    "slice_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Slice\s+Thickness",
+    "homogeneity_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Homogeneity",
+    "noise_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Noise",
+    "mtf_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?MTF",
+    "contrast_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Contrast",
+    "table_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Table\s+Positioning",
+    "tube_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Tube\s+Voltage",
+    "image_start": r"(?mi)(?:\d+(?:\.\d+)*\s+)?Image\s+Inspection",
 }
 
-MODE_HEADER_PATTERNS = {
-    "homogeneity": r"(?mi)^\d+\.3\.(\d+)\s+(.+)$",
-    "noise": r"(?mi)^\d+\.3\.(\d+)\s+(.+)$",
-    "mtf": r"(?mi)^\d+\.3\.(\d+)\s+(.+)$",
-}
-
-TOP_LEVEL_SECTION_RE = re.compile(r"(?mi)^\d+\s+.+$")
+TOP_LEVEL_SECTION_RE = re.compile(r"(?mi)^\d+(\.\d+)*\s+.+$")
 
 DEBUG_MODE = True
 
@@ -375,7 +383,7 @@ def extract_section_by_title(text: str, title_regex: str) -> str:
 
 
 def scan_top_level_sections(text: str):
-    return re.findall(r"(?mi)^\d+\s+.+$", normalize_pdf_text(text))
+    return re.findall(r"(?mi)^\d+(\.\d+)*\s+.+$", normalize_pdf_text(text))
 
 
 def iter_clean_lines(section):
@@ -389,24 +397,6 @@ def value_in_range(value, low, high):
     if value is None or low is None or high is None:
         return False
     return low <= value <= high
-
-
-def split_mode_blocks(section_text: str, header_pattern: str, name_group: int = 2):
-    section_text = normalize_pdf_text(section_text)
-    matches = list(re.finditer(header_pattern, section_text, flags=re.M))
-    if not matches:
-        return []
-
-    blocks = []
-    for i, m in enumerate(matches):
-        name = compact_mode_name(m.group(name_group))
-        start = m.start()
-        end = (
-            matches[i + 1].start() if i + 1 < len(matches) else len(section_text)
-        )
-        block_text = section_text[start:end]
-        blocks.append((name, block_text))
-    return blocks
 
 
 def parse_tolerance_line(line):
@@ -603,51 +593,46 @@ def parse_ct_slice(text):
     if not section:
         return []
     results = []
-    sub_blocks = re.split(r"(?mi)^\d+\.\d+\.\d+\s+", section)
-    for block in sub_blocks:
-        lines = list(iter_clean_lines(block))
-        if not lines:
-            continue
-        seq_label = lines[0]
-        rows = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if re.match(r"^\d+$", line):
-                slice_no = int(line)
-                val = None
-                status = "PASS"
-                for j in range(i + 1, min(i + 5, len(lines))):
-                    cand = lines[j]
-                    if safe_float(cand) is not None and val is None:
-                        val = safe_float(cand)
-                    if "in tol" in cand.lower() or "ok" in cand.lower() or "pass" in cand.lower():
-                        status = "PASS"
-                    elif "out tol" in cand.lower() or "fail" in cand.lower():
-                        status = "FAIL"
-                if val is not None:
-                    rows.append({"slice": slice_no, "value": val, "status": status})
-            i += 1
+    lines = list(iter_clean_lines(section))
+    rows = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r"^\d+$", line):
+            slice_no = int(line)
+            val = None
+            status = "PASS"
+            for j in range(i + 1, min(i + 5, len(lines))):
+                cand = lines[j]
+                if safe_float(cand) is not None and val is None:
+                    val = safe_float(cand)
+                if "in tol" in cand.lower() or "ok" in cand.lower() or "pass" in cand.lower():
+                    status = "PASS"
+                elif "out tol" in cand.lower() or "fail" in cand.lower():
+                    status = "FAIL"
+            if val is not None:
+                rows.append({"slice": slice_no, "value": val, "status": status})
+        i += 1
 
-        if rows:
-            worst, overall_status = summarize_slice_rows(
-                rows, "Slice Thickness", worst_by="max_abs"
+    if rows:
+        worst, overall_status = summarize_slice_rows(
+            rows, "Slice Thickness", worst_by="max_abs"
+        )
+        slice_summary = "; ".join(
+            f"S{r['slice']}={format_num(r['value'])}mm {r['status']}"
+            for r in rows
+        )
+        results.append(
+            make_result(
+                "Slice Thickness",
+                "Standard",
+                worst["value"],
+                "mm",
+                "Slice thickness within tolerance",
+                overall_status,
+                f"Worst slice {worst['slice']} thickness = {format_num(worst['value'])} mm. All slices: {slice_summary}",
             )
-            slice_summary = "; ".join(
-                f"S{r['slice']}={format_num(r['value'])}mm {r['status']}"
-                for r in rows
-            )
-            results.append(
-                make_result(
-                    "Slice Thickness",
-                    seq_label,
-                    worst["value"],
-                    "mm",
-                    "Slice thickness within tolerance",
-                    overall_status,
-                    f"Worst slice {worst['slice']} thickness = {format_num(worst['value'])} mm. All slices: {slice_summary}",
-                )
-            )
+        )
     return results
 
 
@@ -655,199 +640,195 @@ def parse_ct_water_value_and_homogeneity(text):
     section = extract_section_by_title(
         text, SECTION_PATTERNS["homogeneity_start"]
     )
-    mode_blocks = split_mode_blocks(section, MODE_HEADER_PATTERNS["homogeneity"])
+    if not section:
+        return []
 
-    results = []
-    for mode_name, block in mode_blocks:
-        lines = list(iter_clean_lines(block))
+    lines = list(iter_clean_lines(section))
+    water_rows = []
+    diff_rows = []
+    current_slice = None
+    current_low, current_high = -4.0, 4.0
+    in_water = False
 
-        water_rows = []
-        diff_rows = []
-        current_slice = None
-        current_low, current_high = -4.0, 4.0
-        in_water = False
-
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if "Water Value Results" in line:
-                in_water = True
-                i += 1
-                continue
-            if re.match(r"^Slice\s+\d+$", line, re.I):
-                in_water = False
-                current_slice = int(re.search(r"\d+", line).group())
-                i += 1
-                continue
-
-            low, high = parse_tolerance_line(line)
-            if low is not None and high is not None:
-                current_low, current_high = low, high
-                i += 1
-                continue
-
-            if in_water and re.match(r"^\d+$", line):
-                slice_no = int(line)
-                val = safe_float(lines[i + 1]) if i + 1 < len(lines) else None
-                ref = safe_float(lines[i + 2]) if i + 2 < len(lines) else None
-                if val is not None:
-                    status = row_status(val, current_low or -6.0, current_high or 6.0)
-                    water_rows.append({"slice": slice_no, "value": val, "reference": ref, "low": current_low or -6.0, "high": current_high or 6.0, "status": status})
-                i += 3
-                continue
-
-            if current_slice is not None and line in {"Center", "Diff.3", "Diff.6", "Diff.9", "Diff.12"}:
-                pos_name = line
-                val = safe_float(lines[i + 1]) if i + 1 < len(lines) else None
-                ref = safe_float(lines[i + 2]) if i + 2 < len(lines) else None
-                if val is not None and pos_name != "Center":
-                    status = row_status(val, current_low, current_high)
-                    diff_rows.append({"slice": current_slice, "position": pos_name, "value": val, "reference": ref, "low": current_low, "high": current_high, "status": status})
-                i += 3
-                continue
-
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if "Water Value Results" in line or "Water Value" in line:
+            in_water = True
             i += 1
-
-        if water_rows:
-            worst, overall_status = summarize_slice_rows(
-                water_rows, "Water Value", worst_by="max_abs"
-            )
-            slice_summary = "; ".join(
-                f"S{r['slice']}={format_num(r['value'])} HU [{format_num(r['low'], 2)},{format_num(r['high'], 2)}] {r['status']}"
-                for r in water_rows
-            )
-            results.append(
-                make_result(
-                    "Water Value",
-                    mode_name,
-                    abs(worst["value"]),
-                    "HU",
-                    "Worst absolute central ROI CT number within tolerance",
-                    overall_status,
-                    f"Worst slice {worst['slice']} water value = {format_num(worst['value'])} HU; "
-                    f"reference {format_num(worst['reference'])} HU; "
-                    f"tolerance [{format_num(worst['low'], 2)},{format_num(worst['high'], 2)}]. "
-                    f"All slices: {slice_summary}",
-                )
-            )
-
-        if diff_rows:
-            worst, overall_status = summarize_slice_rows(
-                diff_rows, "Homogeneity", worst_by="max_abs"
-            )
-            slice_summary = "; ".join(
-                f"S{r['slice']} {r['position']}={format_num(r['value'])} HU [{format_num(r['low'], 2)},{format_num(r['high'], 2)}] {r['status']}"
-                for r in diff_rows
-            )
-            results.append(
-                make_result(
-                    "Homogeneity",
-                    mode_name,
-                    abs(worst["value"]),
-                    "HU",
-                    "Max peripheral-centre difference within tolerance",
-                    overall_status,
-                    f"Worst slice {worst['slice']} {worst['position']} = {format_num(worst['value'])} HU; "
-                    f"tolerance [{format_num(worst['low'], 2)},{format_num(worst['high'], 2)}]. "
-                    f"All differences: {slice_summary}",
-                )
-            )
-
-    return results
-
-
-def parse_ct_noise(text):
-    section = extract_section_by_title(text, SECTION_PATTERNS["noise_start"])
-    mode_blocks = split_mode_blocks(section, MODE_HEADER_PATTERNS["noise"])
-
-    results = []
-    for mode_name, block in mode_blocks:
-        lines = list(iter_clean_lines(block))
-        rows = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if re.match(r"^\d+$", line) and int(line) <= 6:
-                slice_no = int(line)
-                val = safe_float(lines[i + 1]) if i + 1 < len(lines) else None
-                ref = safe_float(lines[i + 2]) if i + 2 < len(lines) else None
-                low, high = None, None
-                for j in range(i + 3, min(i + 7, len(lines))):
-                    l, h = parse_tolerance_line(lines[j])
-                    if l is not None and h is not None:
-                        low, high = l, h
-                        break
-                if val is not None and low is not None and high is not None:
-                    status = row_status(val, low, high)
-                    rows.append({"slice": slice_no, "value": val, "reference": ref, "low": low, "high": high, "status": status})
+            continue
+        if re.match(r"^Slice\s+\d+$", line, re.I):
+            in_water = False
+            current_slice = int(re.search(r"\d+", line).group())
             i += 1
-
-        if not rows:
             continue
 
+        low, high = parse_tolerance_line(line)
+        if low is not None and high is not None:
+            current_low, current_high = low, high
+            i += 1
+            continue
+
+        if in_water and re.match(r"^\d+$", line):
+            slice_no = int(line)
+            val = safe_float(lines[i + 1]) if i + 1 < len(lines) else None
+            ref = safe_float(lines[i + 2]) if i + 2 < len(lines) else None
+            if val is not None:
+                status = row_status(val, current_low or -6.0, current_high or 6.0)
+                water_rows.append({"slice": slice_no, "value": val, "reference": ref, "low": current_low or -6.0, "high": current_high or 6.0, "status": status})
+            i += 3
+            continue
+
+        if current_slice is not None and line in {"Center", "Diff.3", "Diff.6", "Diff.9", "Diff.12"}:
+            pos_name = line
+            val = safe_float(lines[i + 1]) if i + 1 < len(lines) else None
+            ref = safe_float(lines[i + 2]) if i + 2 < len(lines) else None
+            if val is not None and pos_name != "Center":
+                status = row_status(val, current_low, current_high)
+                diff_rows.append({"slice": current_slice, "position": pos_name, "value": val, "reference": ref, "low": current_low, "high": current_high, "status": status})
+            i += 3
+            continue
+
+        i += 1
+
+    results = []
+    if water_rows:
         worst, overall_status = summarize_slice_rows(
-            rows, "Noise", worst_by="max"
+            water_rows, "Water Value", worst_by="max_abs"
         )
         slice_summary = "; ".join(
             f"S{r['slice']}={format_num(r['value'])} HU [{format_num(r['low'], 2)},{format_num(r['high'], 2)}] {r['status']}"
-            for r in rows
+            for r in water_rows
         )
         results.append(
             make_result(
-                "Noise",
-                mode_name,
-                worst["value"],
+                "Water Value",
+                "Standard",
+                abs(worst["value"]),
                 "HU",
-                "Each slice within slice-specific tolerance",
+                "Worst absolute central ROI CT number within tolerance",
                 overall_status,
-                f"Worst slice {worst['slice']} noise = {format_num(worst['value'])} HU; "
+                f"Worst slice {worst['slice']} water value = {format_num(worst['value'])} HU; "
                 f"reference {format_num(worst['reference'])} HU; "
                 f"tolerance [{format_num(worst['low'], 2)},{format_num(worst['high'], 2)}]. "
                 f"All slices: {slice_summary}",
             )
         )
 
+    if diff_rows:
+        worst, overall_status = summarize_slice_rows(
+            diff_rows, "Homogeneity", worst_by="max_abs"
+        )
+        slice_summary = "; ".join(
+            f"S{r['slice']} {r['position']}={format_num(r['value'])} HU [{format_num(r['low'], 2)},{format_num(r['high'], 2)}] {r['status']}"
+            for r in diff_rows
+        )
+        results.append(
+            make_result(
+                "Homogeneity",
+                "Standard",
+                abs(worst["value"]),
+                "HU",
+                "Max peripheral-centre difference within tolerance",
+                overall_status,
+                f"Worst slice {worst['slice']} {worst['position']} = {format_num(worst['value'])} HU; "
+                f"tolerance [{format_num(worst['low'], 2)},{format_num(worst['high'], 2)}]. "
+                f"All differences: {slice_summary}",
+            )
+        )
+
     return results
+
+
+def parse_ct_noise(text):
+    section = extract_section_by_title(text, SECTION_PATTERNS["noise_start"])
+    if not section:
+        return []
+
+    lines = list(iter_clean_lines(section))
+    rows = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r"^\d+$", line) and int(line) <= 6:
+            slice_no = int(line)
+            val = safe_float(lines[i + 1]) if i + 1 < len(lines) else None
+            ref = safe_float(lines[i + 2]) if i + 2 < len(lines) else None
+            low, high = None, None
+            for j in range(i + 3, min(i + 7, len(lines))):
+                l, h = parse_tolerance_line(lines[j])
+                if l is not None and h is not None:
+                    low, high = l, h
+                    break
+            if val is not None and low is not None and high is not None:
+                status = row_status(val, low, high)
+                rows.append({"slice": slice_no, "value": val, "reference": ref, "low": low, "high": high, "status": status})
+        i += 1
+
+    if not rows:
+        return []
+
+    worst, overall_status = summarize_slice_rows(
+        rows, "Noise", worst_by="max"
+    )
+    slice_summary = "; ".join(
+        f"S{r['slice']}={format_num(r['value'])} HU [{format_num(r['low'], 2)},{format_num(r['high'], 2)}] {r['status']}"
+        for r in rows
+    )
+    return [
+        make_result(
+            "Noise",
+            "Standard",
+            worst["value"],
+            "HU",
+            "Each slice within slice-specific tolerance",
+            overall_status,
+            f"Worst slice {worst['slice']} noise = {format_num(worst['value'])} HU; "
+            f"reference {format_num(worst['reference'])} HU; "
+            f"tolerance [{format_num(worst['low'], 2)},{format_num(worst['high'], 2)}]. "
+            f"All slices: {slice_summary}",
+        )
+    ]
 
 
 def parse_ct_mtf(text):
     section = extract_section_by_title(text, SECTION_PATTERNS["mtf_start"])
-    mode_blocks = split_mode_blocks(section, MODE_HEADER_PATTERNS["mtf"])
+    if not section:
+        return []
+
+    lines = list(iter_clean_lines(section))
+    rows50 = []
+    rows10 = []
+    tol50, tol10 = (3.5, 4.28), (5.73, 7.01)
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if "Tolerance:" in line:
+            l, h = parse_tolerance_line(line)
+            if l is not None:
+                tol50 = (l, h)
+        if re.match(r"^\d+$", line) and int(line) <= 6:
+            slice_no = int(line)
+            vals = []
+            for j in range(i + 1, min(i + 5, len(lines))):
+                sf = safe_float(lines[j])
+                if sf is not None:
+                    vals.append(sf)
+            if len(vals) >= 2:
+                rows50.append({"slice": slice_no, "value": vals[0], "reference": vals[1], "low": tol50[0], "high": tol50[1], "status": row_status(vals[0], tol50[0], tol50[1])})
+            if len(vals) >= 4:
+                rows10.append({"slice": slice_no, "value": vals[2], "reference": vals[3], "low": tol10[0], "high": tol10[1], "status": row_status(vals[2], tol10[0], tol10[1])})
+        i += 1
 
     results = []
-    for mode_name, block in mode_blocks:
-        lines = list(iter_clean_lines(block))
-        rows50 = []
-        rows10 = []
-        tol50, tol10 = (3.5, 4.28), (5.73, 7.01)
+    if rows50:
+        worst50, status50 = summarize_slice_rows(rows50, "MTF 50%", worst_by="min")
+        results.append(make_result("MTF 50%", "Standard", worst50["value"], "lp/cm", "All slices within MTF 50% tolerance", status50, f"Worst slice {worst50['slice']} MTF 50% = {format_num(worst50['value'])} lp/cm"))
 
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if "Tolerance:" in line:
-                l, h = parse_tolerance_line(line)
-                if l is not None:
-                    tol50 = (l, h)
-            if re.match(r"^\d+$", line) and int(line) <= 6:
-                slice_no = int(line)
-                vals = []
-                for j in range(i + 1, min(i + 5, len(lines))):
-                    sf = safe_float(lines[j])
-                    if sf is not None:
-                        vals.append(sf)
-                if len(vals) >= 2:
-                    rows50.append({"slice": slice_no, "value": vals[0], "reference": vals[1], "low": tol50[0], "high": tol50[1], "status": row_status(vals[0], tol50[0], tol50[1])})
-                if len(vals) >= 4:
-                    rows10.append({"slice": slice_no, "value": vals[2], "reference": vals[3], "low": tol10[0], "high": tol10[1], "status": row_status(vals[2], tol10[0], tol10[1])})
-            i += 1
-
-        if rows50:
-            worst50, status50 = summarize_slice_rows(rows50, "MTF 50%", worst_by="min")
-            results.append(make_result("MTF 50%", mode_name, worst50["value"], "lp/cm", "All slices within MTF 50% tolerance", status50, f"Worst slice {worst50['slice']} MTF 50% = {format_num(worst50['value'])} lp/cm"))
-
-        if rows10:
-            worst10, status10 = summarize_slice_rows(rows10, "MTF 10%", worst_by="min")
-            results.append(make_result("MTF 10%", mode_name, worst10["value"], "lp/cm", "All slices within MTF 10% tolerance", status10, f"Worst slice {worst10['slice']} MTF 10% = {format_num(worst10['value'])} lp/cm"))
+    if rows10:
+        worst10, status10 = summarize_slice_rows(rows10, "MTF 10%", worst_by="min")
+        results.append(make_result("MTF 10%", "Standard", worst10["value"], "lp/cm", "All slices within MTF 10% tolerance", status10, f"Worst slice {worst10['slice']} MTF 10% = {format_num(worst10['value'])} lp/cm"))
 
     return results
 
@@ -891,6 +872,8 @@ def parse_ct_contrast(text):
 
 def parse_ct_table_positioning(text):
     section = extract_section_by_title(text, SECTION_PATTERNS["table_start"])
+    if not section:
+        return []
     nominal_map = {1: -300.0, 2: 0.0, 3: 300.0, 4: 0.0}
     cont_rows, step_rows = [], []
 
@@ -931,6 +914,8 @@ def parse_ct_table_positioning(text):
 
 def parse_ct_tube_voltage(text):
     section = extract_section_by_title(text, SECTION_PATTERNS["tube_start"])
+    if not section:
+        return []
     rows = []
     for line in iter_clean_lines(section):
         m = re.search(rf"^({NUM})\s+({NUM})\s+({NUM})", line, re.I)
@@ -960,6 +945,8 @@ def parse_ct_tube_voltage(text):
 
 def parse_ct_image_inspection(text):
     section = extract_section_by_title(text, SECTION_PATTERNS["image_start"])
+    if not section:
+        return []
     status = "PASS"
     details = "Image inspection completed successfully."
     for line in iter_clean_lines(section):
@@ -1241,7 +1228,6 @@ def main():
     with st.sidebar:
         st.header("GitHub Sync")
 
-        # Check if secrets are fully populated
         secrets_ready = bool(
             DEFAULT_GITHUB_TOKEN
             and DEFAULT_GITHUB_OWNER != "YOUR_GITHUB_USERNAME"
@@ -1250,7 +1236,6 @@ def main():
 
         if secrets_ready:
             st.success("Connected via Streamlit Secrets ✅")
-            # Keep manual fields tucked inside an expander for optional overrides
             with st.expander("Override Configuration"):
                 github_token = st.text_input(
                     "GitHub Token", value=DEFAULT_GITHUB_TOKEN, type="password"
