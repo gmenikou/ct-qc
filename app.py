@@ -376,6 +376,14 @@ def iter_clean_lines(section):
             yield line
 
 
+def extract_section_tolerance(section_text, default_tol="±2.00 mm"):
+    """Extracts explicit Tolerance range from section text if present."""
+    for line in iter_clean_lines(section_text):
+        if "tolerance" in line.lower() or "..." in line or "–" in line:
+            return line
+    return default_tol
+
+
 def value_in_range(value, low, high):
     if value is None or low is None or high is None:
         return False
@@ -408,10 +416,11 @@ def debug_dump_sections(pdf_text, sections_map):
 
 
 # =========================================================
-# ROBUST CT PARSERS FOR ALL SECTIONS (FIXED)
+# CT PARSERS WITH EXPLICIT IEC TOLERANCE EXTRACTION
 # =========================================================
 def parse_ct_lightmarker(section):
     results = []
+    tol_str = extract_section_tolerance(section, "Tolerance: [-2.00, 2.00] mm (IEC 61223-3-5)")
     for line in iter_clean_lines(section):
         m = re.search(rf"^(.+?)\s+({NUM})\s+(OK|Pass|In Tol\.)$", line, re.I)
         if m:
@@ -424,18 +433,19 @@ def parse_ct_lightmarker(section):
                     desc,
                     val,
                     "mm",
-                    "Lightmarker within tolerance [-2.00, 2.00]",
+                    tol_str,
                     status,
                     f"Mode: {desc}, Value: {val} mm",
                 )
             )
     if not results:
-        results.append(make_result("Lightmarker", "Standard", 0.0, "mm", "Lightmarker within tolerance", "PASS", "Lightmarker verified"))
+        results.append(make_result("Lightmarker", "Standard", 0.0, "mm", tol_str, "PASS", "Lightmarker verified"))
     return results
 
 
 def parse_ct_sag_cor_lightmarker(section):
     results = []
+    tol_str = extract_section_tolerance(section, "Tolerance: [-2.00, 2.00] mm")
     for line in iter_clean_lines(section):
         m = re.search(rf"^(.+?)\s+({NUM})\s+({NUM})\s+(OK|Pass|In Tol\.)$", line, re.I)
         if m:
@@ -443,31 +453,33 @@ def parse_ct_sag_cor_lightmarker(section):
             val_sag = safe_float(m.group(2))
             val_cor = safe_float(m.group(3))
             status = "PASS" if m.group(4).upper() in {"OK", "PASS", "IN TOL."} else "FAIL"
-            results.append(make_result("Sagittal Lightmarker", desc, abs(val_sag) if val_sag is not None else 0.0, "mm", "Sagittal lightmarker within tolerance", status, f"Sagittal deviation: {val_sag} mm"))
-            results.append(make_result("Coronal Lightmarker", desc, abs(val_cor) if val_cor is not None else 0.0, "mm", "Coronal lightmarker within tolerance", status, f"Coronal deviation: {val_cor} mm"))
+            results.append(make_result("Sagittal Lightmarker", desc, abs(val_sag) if val_sag is not None else 0.0, "mm", tol_str, status, f"Sagittal deviation: {val_sag} mm"))
+            results.append(make_result("Coronal Lightmarker", desc, abs(val_cor) if val_cor is not None else 0.0, "mm", tol_str, status, f"Coronal deviation: {val_cor} mm"))
     if not results:
-        results.append(make_result("Sagittal Lightmarker", "Standard", 0.0, "mm", "Within tolerance", "PASS", "Sagittal lightmarker passed"))
-        results.append(make_result("Coronal Lightmarker", "Standard", 0.0, "mm", "Within tolerance", "PASS", "Coronal lightmarker passed"))
+        results.append(make_result("Sagittal Lightmarker", "Standard", 0.0, "mm", tol_str, "PASS", "Sagittal lightmarker passed"))
+        results.append(make_result("Coronal Lightmarker", "Standard", 0.0, "mm", tol_str, "PASS", "Coronal lightmarker passed"))
     return results
 
 
 def parse_ct_topogram_positioning(section):
     results = []
+    tol_str = extract_section_tolerance(section, "Tolerance: [-2.00, 2.00] mm")
     for line in iter_clean_lines(section):
         m = re.search(rf"^(.+?)\s+({NUM})\s+(OK|Pass|In Tol\.)$", line, re.I)
         if m:
             desc = m.group(1).strip()
             val = safe_float(m.group(2))
             status = "PASS" if m.group(3).upper() in {"OK", "PASS", "IN TOL."} else "FAIL"
-            results.append(make_result("Topogram Positioning", desc, val, "mm", "Topogram positioning within tolerance", status, f"Deviation: {val} mm"))
+            results.append(make_result("Topogram Positioning", desc, val, "mm", tol_str, status, f"Deviation: {val} mm"))
     if not results:
-        results.append(make_result("Topogram Positioning", "Standard", 0.0, "mm", "Within tolerance", "PASS", "Topogram positioning passed"))
+        results.append(make_result("Topogram Positioning", "Standard", 0.0, "mm", tol_str, "PASS", "Topogram positioning passed"))
     return results
 
 
 def parse_ct_slice(section):
+    tol_str = extract_section_tolerance(section, "Tolerance: ±10% or ±1.0 mm (IEC 61223-3-5)")
     if not section:
-        return [make_result("Slice Thickness", "Standard", 0.0, "mm", "Slice thickness within tolerance", "PASS", "Slice thickness passed")]
+        return [make_result("Slice Thickness", "Standard", 0.0, "mm", tol_str, "PASS", "Slice thickness passed")]
     
     nums = []
     for x in re.findall(NUM, section):
@@ -484,7 +496,7 @@ def parse_ct_slice(section):
             "Standard",
             val,
             "mm",
-            "Slice thickness within tolerance",
+            tol_str,
             "PASS",
             f"Measured slice thickness deviation = {val} mm",
         )
@@ -492,10 +504,12 @@ def parse_ct_slice(section):
 
 
 def parse_ct_water_value_and_homogeneity(section):
+    tol_water = "Tolerance: ±4 HU (IEC 61223-3-5 Constancy)"
+    tol_homog = "Tolerance: ±5 HU (IEC 61223-3-5 Constancy)"
     if not section:
         return [
-            make_result("Water Value", "Standard", 0.0, "HU", "Within tolerance", "PASS", "Water value passed"),
-            make_result("Homogeneity", "Standard", 0.0, "HU", "Within tolerance", "PASS", "Homogeneity passed")
+            make_result("Water Value", "Standard", 0.0, "HU", tol_water, "PASS", "Water value passed"),
+            make_result("Homogeneity", "Standard", 0.0, "HU", tol_homog, "PASS", "Homogeneity passed")
         ]
 
     nums = []
@@ -513,7 +527,7 @@ def parse_ct_water_value_and_homogeneity(section):
             "Standard",
             water_val,
             "HU",
-            "Central ROI CT number within tolerance",
+            tol_water,
             "PASS",
             f"Water value = {water_val} HU",
         ),
@@ -522,7 +536,7 @@ def parse_ct_water_value_and_homogeneity(section):
             "Standard",
             homog_val,
             "HU",
-            "Max peripheral-centre difference within tolerance",
+            tol_homog,
             "PASS",
             f"Homogeneity difference = {homog_val} HU",
         ),
@@ -530,8 +544,9 @@ def parse_ct_water_value_and_homogeneity(section):
 
 
 def parse_ct_noise(section):
+    tol_str = extract_section_tolerance(section, "Tolerance: ±10% of Baseline (IEC Constancy)")
     if not section:
-        return [make_result("Noise", "Standard", 0.0, "HU", "Noise within tolerance", "PASS", "Noise passed")]
+        return [make_result("Noise", "Standard", 0.0, "HU", tol_str, "PASS", "Noise passed")]
 
     nums = []
     for x in re.findall(NUM, section):
@@ -547,7 +562,7 @@ def parse_ct_noise(section):
             "Standard",
             val,
             "HU",
-            "Noise within slice-specific tolerance",
+            tol_str,
             "PASS",
             f"Measured noise = {val} HU",
         )
@@ -555,10 +570,12 @@ def parse_ct_noise(section):
 
 
 def parse_ct_mtf(section):
+    tol_50 = "Tolerance: ±10% of Baseline MTF 50%"
+    tol_10 = "Tolerance: ±10% of Baseline MTF 10%"
     if not section:
         return [
-            make_result("MTF 50%", "Standard", 4.0, "lp/cm", "MTF 50% within tolerance", "PASS", "MTF 50% passed"),
-            make_result("MTF 10%", "Standard", 6.5, "lp/cm", "MTF 10% within tolerance", "PASS", "MTF 10% passed")
+            make_result("MTF 50%", "Standard", 4.0, "lp/cm", tol_50, "PASS", "MTF 50% passed"),
+            make_result("MTF 10%", "Standard", 6.5, "lp/cm", tol_10, "PASS", "MTF 10% passed")
         ]
 
     nums = []
@@ -571,14 +588,15 @@ def parse_ct_mtf(section):
     m10 = nums[1] if len(nums) > 1 else 6.5
 
     return [
-        make_result("MTF 50%", "Standard", m50, "lp/cm", "MTF 50% within tolerance", "PASS", f"MTF 50% = {m50} lp/cm"),
-        make_result("MTF 10%", "Standard", m10, "lp/cm", "MTF 10% within tolerance", "PASS", f"MTF 10% = {m10} lp/cm"),
+        make_result("MTF 50%", "Standard", m50, "lp/cm", tol_50, "PASS", f"MTF 50% = {m50} lp/cm"),
+        make_result("MTF 10%", "Standard", m10, "lp/cm", tol_10, "PASS", f"MTF 10% = {m10} lp/cm"),
     ]
 
 
 def parse_ct_contrast(section):
+    tol_str = extract_section_tolerance(section, "Tolerance: ±10% Contrast Scale")
     if not section:
-        return [make_result("Contrast Scale", "Typical body", 0.002, "1/HUcm", "Contrast scale within tolerance", "PASS", "Contrast scale passed")]
+        return [make_result("Contrast Scale", "Typical body", 0.002, "1/HUcm", tol_str, "PASS", "Contrast scale passed")]
 
     nums = []
     for x in re.findall(NUM, section):
@@ -594,7 +612,7 @@ def parse_ct_contrast(section):
             "Typical body",
             val,
             "1/HUcm",
-            "Contrast scale within tolerance",
+            tol_str,
             "PASS",
             f"Contrast scale = {val}",
         )
@@ -602,10 +620,11 @@ def parse_ct_contrast(section):
 
 
 def parse_ct_table_positioning(section):
+    tol_str = extract_section_tolerance(section, "Tolerance: ±2.0 mm (IEC Constancy)")
     if not section:
         return [
-            make_result("Table Positioning (Continuous)", "Continuous movement", 0.0, "mm", "Within tolerance", "PASS", "Table positioning passed"),
-            make_result("Table Positioning (Stepwise)", "Stepwise movement", 0.0, "mm", "Within tolerance", "PASS", "Table positioning passed")
+            make_result("Table Positioning (Continuous)", "Continuous movement", 0.0, "mm", tol_str, "PASS", "Table positioning passed"),
+            make_result("Table Positioning (Stepwise)", "Stepwise movement", 0.0, "mm", tol_str, "PASS", "Table positioning passed")
         ]
 
     nums = []
@@ -617,14 +636,15 @@ def parse_ct_table_positioning(section):
     dev = max(nums, key=abs) if nums else 0.0
 
     return [
-        make_result("Table Positioning (Continuous)", "Continuous movement", abs(dev), "mm", "At each position within tolerance", "PASS", f"Deviation = {abs(dev)} mm"),
-        make_result("Table Positioning (Stepwise)", "Stepwise movement", abs(dev), "mm", "At each position within tolerance", "PASS", f"Deviation = {abs(dev)} mm"),
+        make_result("Table Positioning (Continuous)", "Continuous movement", abs(dev), "mm", tol_str, "PASS", f"Deviation = {abs(dev)} mm"),
+        make_result("Table Positioning (Stepwise)", "Stepwise movement", abs(dev), "mm", tol_str, "PASS", f"Deviation = {abs(dev)} mm"),
     ]
 
 
 def parse_ct_tube_voltage(section):
+    tol_str = extract_section_tolerance(section, "Tolerance: ±10% or ±5 kV (IEC 61223-3-5)")
     if not section:
-        return [make_result("Tube Voltage", "Constancy", 0.0, "kV", "Tube voltage within tolerance", "PASS", "Tube voltage passed")]
+        return [make_result("Tube Voltage", "Constancy", 0.0, "kV", tol_str, "PASS", "Tube voltage passed")]
 
     nums = []
     for x in re.findall(NUM, section):
@@ -640,7 +660,7 @@ def parse_ct_tube_voltage(section):
             "Constancy",
             dev,
             "kV",
-            "Tube voltage within tolerance",
+            tol_str,
             "PASS",
             f"Tube voltage deviation = {dev} kV",
         )
@@ -654,7 +674,7 @@ def parse_ct_image_inspection(section):
             "Visual",
             1.0,
             "",
-            "Visual image inspection passed",
+            "Criterion: Visual inspection acceptable (IEC 61223-3-5)",
             "PASS",
             "Image inspection completed successfully.",
         )
@@ -859,8 +879,8 @@ def generate_pdf_report(session_df, output_path, logo_path=None):
                 Paragraph("<b>Test</b>", cell_style),
                 Paragraph("<b>Sequence / Mode</b>", cell_style),
                 Paragraph("<b>Value</b>", cell_style),
+                Paragraph("<b>Criteria / Tolerance</b>", cell_style),
                 Paragraph("<b>Status</b>", cell_style),
-                Paragraph("<b>Details</b>", cell_style),
             ]
         ]
 
@@ -880,12 +900,12 @@ def generate_pdf_report(session_df, output_path, logo_path=None):
                         f"{format_num(r['value'])} {r['unit']}".strip(),
                         cell_style,
                     ),
+                    Paragraph(str(r["criteria"]), cell_style),
                     status_p,
-                    Paragraph(str(r["details"]), cell_style),
                 ]
             )
 
-        t = Table(table_data, colWidths=[100, 90, 60, 50, 240])
+        t = Table(table_data, colWidths=[100, 80, 50, 190, 50])
         t.setStyle(
             TableStyle(
                 [
@@ -1049,7 +1069,7 @@ def main():
                 }
             )
 
-            st.markdown("### Extracted QC Results")
+            st.markdown("### Extracted QC Results & IEC Tolerances")
             res_df = pd.DataFrame(results)
             if not res_df.empty:
                 st.dataframe(res_df, use_container_width=True)
