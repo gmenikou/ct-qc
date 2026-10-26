@@ -412,7 +412,6 @@ def parse_tolerance_line(line):
     if m:
         return safe_float(m.group(1)), safe_float(m.group(2))
 
-    # Fallback to handle Siemens merged or colon-separated tolerances
     cleaned = line.replace(":", ".")
     nums = [safe_float(x) for x in re.findall(NUM, cleaned)]
     if (
@@ -459,6 +458,39 @@ def make_result(
         "details": details,
         "sequence_label": sequence_label,
     }
+
+
+def debug_dump_sections(pdf_text):
+    if not DEBUG_MODE:
+        return
+
+    sections = {
+        "LIGHTMARKER": SECTION_PATTERNS["lightmarker_start"],
+        "SAG_COR": SECTION_PATTERNS["sag_cor_lightmarker_start"],
+        "TOPOGRAM": SECTION_PATTERNS["topogram_start"],
+        "SLICE": SECTION_PATTERNS["slice_start"],
+        "HOMOGENEITY": SECTION_PATTERNS["homogeneity_start"],
+        "NOISE": SECTION_PATTERNS["noise_start"],
+        "MTF": SECTION_PATTERNS["mtf_start"],
+        "CONTRAST": SECTION_PATTERNS["contrast_start"],
+        "TABLE": SECTION_PATTERNS["table_start"],
+        "TUBE": SECTION_PATTERNS["tube_start"],
+        "IMAGE": SECTION_PATTERNS["image_start"],
+    }
+
+    with st.expander("DEBUG: section match dump"):
+        st.write("Top-level sections found:")
+        st.write(scan_top_level_sections(pdf_text))
+
+        for name, pattern in sections.items():
+            matches = list(re.finditer(pattern, pdf_text, flags=re.I | re.M))
+            st.write(f"### {name}")
+            st.write(f"Matches found: {len(matches)}")
+            for i, m in enumerate(matches):
+                start = max(0, m.start() - 80)
+                end = min(len(pdf_text), m.end() + 200)
+                snippet = pdf_text[start:end]
+                st.code(f"[Match {i}]\n{snippet}")
 
 
 # =========================================================
