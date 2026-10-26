@@ -31,12 +31,15 @@ import streamlit as st
 APP_TITLE = "CT IEC Constancy QC Reporter"
 
 # =========================================================
-# EDIT THESE ONCE
+# GITHUB SECRETS INTEGRATION
 # =========================================================
-DEFAULT_GITHUB_OWNER = "YOUR_GITHUB_USERNAME"
-DEFAULT_GITHUB_REPO = "YOUR_REPO_NAME"
-DEFAULT_GITHUB_BRANCH = "main"
-DEFAULT_GITHUB_CSV_PATH = "ct_qc_data/ct_qc_history.csv"
+sec_github = st.secrets.get("github", {}) if hasattr(st, "secrets") else {}
+
+DEFAULT_GITHUB_OWNER = sec_github.get("owner", "YOUR_GITHUB_USERNAME")
+DEFAULT_GITHUB_REPO = sec_github.get("repo", "YOUR_REPO_NAME")
+DEFAULT_GITHUB_BRANCH = sec_github.get("branch", "main")
+DEFAULT_GITHUB_CSV_PATH = sec_github.get("path", "ct_qc_data/ct_qc_history.csv")
+DEFAULT_GITHUB_TOKEN = sec_github.get("token", "")
 
 DATA_DIR = Path("ct_qc_data")
 LOCAL_HISTORY_CSV = DATA_DIR / "ct_qc_history.csv"
@@ -1554,7 +1557,9 @@ def main():
 
     with st.sidebar:
         st.header("Configuration & GitHub Sync")
-        github_token = st.text_input("GitHub Token", type="password")
+        github_token = st.text_input(
+            "GitHub Token", value=DEFAULT_GITHUB_TOKEN, type="password"
+        )
         github_owner = st.text_input(
             "GitHub Owner", value=DEFAULT_GITHUB_OWNER
         )
